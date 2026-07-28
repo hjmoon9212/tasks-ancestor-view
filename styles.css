@@ -1,0 +1,4 @@
+/* Tasks Ancestor View – hide non-ancestor items */
+.tasks-ancestor-hidden {
+    display: none !important;
+}

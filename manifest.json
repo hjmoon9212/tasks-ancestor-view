@@ -1,0 +1,9 @@
+{
+  "id": "tasks-ancestor-view",
+  "name": "Tasks Ancestor View",
+  "version": "2.0.2",
+  "minAppVersion": "1.4.0",
+  "description": "Show only the ancestor chain of matching tasks. Companion plugin for Obsidian Tasks.",
+  "author": "Custom",
+  "isDesktopOnly": false
+}
