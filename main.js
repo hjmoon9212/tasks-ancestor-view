@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.4.2';
+var VERSION = '2.5.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -835,6 +835,7 @@ var AncestorRenderChild = (function (_super) {
                 // Strip any stale nested UL left over from a prior render pass.
                 stripNestedUls(li);
                 li.setAttribute('data-tav', 'match');
+                this._wireMatchedLi(li, child.item);
             } else {
                 // Pure ancestor (not a matching task) -> create a new <li>.
                 li = await this._createAncestorLi(child.item);
@@ -848,6 +849,48 @@ var AncestorRenderChild = (function (_super) {
                 await this._renderTree(nestedUl, child);
             }
         }
+    };
+
+    /**
+     * Let the matched task's description open its source line too.
+     *
+     * Tasks only wires its backlink, so the description itself does nothing on
+     * click - which reads as inconsistent once the grey ancestor and descendant
+     * rows around it are all clickable.
+     *
+     * This <li> belongs to Tasks and is MOVED between passes rather than
+     * rebuilt, so the listener is attached once and everything that can change
+     * is read at click time:
+     *   - the item hangs off the element, not a closure, because Tasks hands us
+     *     a fresh Task object on every re-parse and a captured one goes stale;
+     *   - the setting is read inside the handler, so toggling it needs no rewiring.
+     */
+    AncestorRenderChild.prototype._wireMatchedLi = function (li, item) {
+        li._tavItem = item;
+
+        var enabled = this._settings().clickToOpen && !!itemLocation(item);
+        li.classList.toggle('tasks-ancestor-clickable-task', enabled);
+
+        if (li.getAttribute('data-tav-click')) return;
+        var span = ownQuery(li, '.tasks-list-text');
+        if (!span) return;
+        li.setAttribute('data-tav-click', '1');
+
+        var self = this;
+        var open = function (evt, newTab) {
+            if (!self._settings().clickToOpen) return;
+            var loc = itemLocation(li._tavItem);
+            if (!loc) return;
+            // _openSource steps aside for tags and the backlink (closest('a')),
+            // so those keep running Tasks' own handlers.
+            self._openSource(loc, li._tavItem, evt, newTab).catch(function (e) {
+                console.error('Tasks Ancestor View v' + VERSION + ': open failed', e);
+            });
+        };
+        span.addEventListener('click', function (evt) { open(evt, false); });
+        span.addEventListener('auxclick', function (evt) {
+            if (evt.button === 1) open(evt, true);
+        });
     };
 
     /**
@@ -1024,10 +1067,10 @@ var AncestorSettingTab = (function (_super) {
             });
 
         new obsidian.Setting(el)
-            .setName('조상 클릭 시 원본으로 이동')
+            .setName('클릭하면 원본으로 이동')
             .setDesc(
-                '조상 항목의 텍스트를 클릭하면 그 줄이 있는 노트를 엽니다. ' +
-                'Ctrl/Cmd+클릭과 가운데 클릭은 새 탭에서 엽니다.'
+                '항목의 텍스트를 클릭하면 그 줄이 있는 노트를 엽니다. ' +
+                'Ctrl/Cmd+클릭과 가운데 클릭은 새 탭에서 열고, 이미 열려 있으면 그 탭으로 갑니다.'
             )
             .addToggle(function (t) {
                 t.setValue(s.clickToOpen).onChange(async function (v) {

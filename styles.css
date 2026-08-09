@@ -19,3 +19,9 @@
     color: var(--text-normal);
     text-decoration: underline;
 }
+
+/* The matched task's description opens its source line too (v2.5.0). Tags,
+   links and the backlink inside it keep their own cursor and behaviour. */
+.tasks-ancestor-clickable-task .tasks-list-text {
+    cursor: pointer;
+}
