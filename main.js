@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.1.0';
+var VERSION = '2.2.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -99,6 +99,37 @@ function itemKey(item) {
     // 3) Last-resort fallback - collapses items with identical text in same
     //    file, which is acceptable since they would render identically anyway.
     return 'md:' + (item.originalMarkdown || '').trim() + '|' + path;
+}
+
+// Source location of a Task / ListItem, or null when it cannot be determined.
+// Same field fallbacks as itemKey() - Tasks exposes taskLocation on live objects
+// and _taskLocation on some cached ones.
+function itemLocation(item) {
+    if (!item) return null;
+    var loc = item.taskLocation || item._taskLocation || null;
+    var path = (loc && (loc.path || loc._path)) || item.path || '';
+    var line = loc && (loc.lineNumber != null ? loc.lineNumber : loc._lineNumber);
+    if (line == null) line = item.lineNumber;
+    if (line == null) line = item._lineNumber;
+    if (!path || line == null || line < 0) return null;
+    return { path: path, line: line };
+}
+
+// Where the item's source line lives *now*. The recorded line number is from
+// whenever Tasks last parsed the file, so an edit above it shifts the target.
+// Tasks' own backlink resolves this the same way: trust the recorded line while
+// it still holds the original markdown, else look for a unique match.
+// Ambiguous (several identical lines) or missing -> keep the recorded line.
+function resolveLine(lines, originalMarkdown, hintLine) {
+    if (!originalMarkdown) return hintLine;
+    if (lines[hintLine] === originalMarkdown) return hintLine;
+    var found = -1;
+    for (var i = 0; i < lines.length; i++) {
+        if (lines[i] !== originalMarkdown) continue;
+        if (found !== -1) return hintLine;   // 여러 줄이 동일 -> 고르지 않는다
+        found = i;
+    }
+    return found === -1 ? hintLine : found;
 }
 
 // Backlink text is rendered as "filename > heading" (Tasks getLinkText()).
@@ -692,7 +723,68 @@ var AncestorRenderChild = (function (_super) {
         // Marks this <li> as ours so the next pass can discard it - see
         // _processOneUl. Without the marker these accumulate at list end.
         li.setAttribute('data-tav', 'ancestor');
+
+        // An ancestor is context, not a query result, so Tasks gives it no
+        // backlink. Make the label open its source line instead, so it behaves
+        // like the matched tasks around it.
+        var loc = itemLocation(item);
+        if (loc) {
+            var self = this;
+            li.classList.add('tasks-ancestor-clickable');
+            span.setAttribute('aria-label', loc.path + ':' + (loc.line + 1));
+            // addEventListener, not registerDomEvent: ancestor <li>s are thrown
+            // away and rebuilt on every pass. Registering on the component would
+            // pin every discarded element's handler for the block's lifetime.
+            // _openSource is async - an unhandled rejection here would be
+            // invisible to the user, so report it and move on.
+            var open = function (evt, newTab) {
+                self._openSource(loc, item, evt, newTab).catch(function (e) {
+                    console.error('Tasks Ancestor View v' + VERSION + ': open failed', e);
+                });
+            };
+            span.addEventListener('click', function (evt) { open(evt, false); });
+            span.addEventListener('auxclick', function (evt) {
+                if (evt.button === 1) open(evt, true);
+            });
+        }
         return li;
+    };
+
+    /**
+     * Open the ancestor item's source line.
+     *
+     * @param newTab true for a middle click; otherwise ctrl/cmd decides (same
+     *               gesture set as Tasks' backlink).
+     */
+    AncestorRenderChild.prototype._openSource = async function (loc, item, evt, newTab) {
+        // Tags and links inside the label render as real <a> elements (that is
+        // why we render the markdown at all) - let them handle their own clicks.
+        if (evt.target && evt.target.closest && evt.target.closest('a')) return;
+
+        evt.preventDefault();
+        evt.stopPropagation();
+
+        var app = this._app;
+        var file = app.vault.getAbstractFileByPath(loc.path);
+        if (!file || (obsidian.TFile && !(file instanceof obsidian.TFile))) {
+            new obsidian.Notice('Tasks Ancestor View: source file not found - ' + loc.path);
+            return;
+        }
+
+        var line = loc.line;
+        try {
+            var content = await app.vault.cachedRead(file);
+            line = resolveLine(content.split('\n'), (item && item.originalMarkdown) || '', loc.line);
+        } catch (e) {
+            // Still open the file - a stale line number beats not opening at all.
+            console.error('Tasks Ancestor View v' + VERSION + ': source read failed', e);
+        }
+
+        var mod = !newTab && obsidian.Keymap && obsidian.Keymap.isModEvent
+            ? obsidian.Keymap.isModEvent(evt)
+            : false;
+        var leaf = app.workspace.getLeaf(newTab ? 'tab' : mod);
+        await leaf.openFile(file, { eState: { line: line } });
     };
 
     return AncestorRenderChild;
@@ -709,6 +801,8 @@ exports._internals = {
     normalizeWS: normalizeWS,
     plainify: plainify,
     itemKey: itemKey,
+    itemLocation: itemLocation,
+    resolveLine: resolveLine,
     backlinkBonus: backlinkBonus,
     scoreEntry: scoreEntry,
     buildIndex: buildIndex

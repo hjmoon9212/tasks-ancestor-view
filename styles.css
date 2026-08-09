@@ -8,3 +8,14 @@
 .tasks-ancestor-item .task-list-item-checkbox {
     cursor: default;
 }
+
+/* Ancestors whose source line we can open. Tags and links inside the label
+   keep their own cursor and handle their own clicks. */
+.tasks-ancestor-clickable .tasks-ancestor-label {
+    cursor: pointer;
+}
+
+.tasks-ancestor-clickable .tasks-ancestor-label:hover {
+    color: var(--text-normal);
+    text-decoration: underline;
+}

@@ -84,6 +84,23 @@ group by filename
 
 기존 `tasks` 코드블록에서 블록 이름만 `tasks-ancestors`로 바꾸면 됩니다.
 
+### 조상 항목 클릭 → 원본으로 이동
+
+회색으로 표시되는 조상 항목의 **텍스트를 클릭**하면 그 항목이 적힌 원본 노트의
+해당 줄로 이동합니다. 매칭된 태스크의 백링크와 같은 제스처를 씁니다:
+
+| 제스처 | 동작 |
+|--------|------|
+| 클릭 | 현재 탭에서 열기 |
+| Ctrl/Cmd + 클릭 | 새 탭(또는 분할)에서 열기 |
+| 가운데 클릭 | 새 탭에서 열기 |
+
+조상 텍스트 안의 태그·링크는 원래대로 자기 동작을 유지합니다(태그 클릭 = 태그 검색).
+줄 번호는 Tasks가 마지막으로 파싱한 시점의 값이라, 그 사이 파일 위쪽이 편집됐으면
+어긋날 수 있습니다. 그래서 이동 전에 **원문이 그 줄에 그대로 있는지 확인**하고,
+아니면 파일 안에서 원문이 유일하게 일치하는 줄을 찾습니다. 동일한 줄이 여럿이면
+고르지 않고 기록된 줄로 갑니다.
+
 ---
 
 ## 동작 원리
@@ -143,6 +160,7 @@ tasks-ancestor-view/
 ├── styles.css               ← 스타일시트
 ├── package.json             ← 테스트 스크립트만 (의존성 없음)
 ├── tests/matching.test.js   ← 매칭 순수함수 단위 테스트
+├── tests/navigation.test.js ← 위치 해석 순수함수 단위 테스트
 └── README.md                ← 이 문서
 ```
 
@@ -172,11 +190,13 @@ TasksAncestorPlugin (extends obsidian.Plugin)
     ├── _bestOf()          → 후보 풀에서 최고 점수 선택
     ├── _buildTree()       → parent 체인 → 가상 트리 노드 구축
     ├── _renderTree()      → 가상 트리 → DOM 렌더링
-    └── _createAncestorLi()→ 조상 항목 <li> 생성
+    ├── _createAncestorLi()→ 조상 항목 <li> 생성 (+ 클릭 핸들러)
+    └── _openSource()      → 원본 파일 열고 해당 줄로 이동
 ```
 
 모듈 최상위의 순수함수(`stripCheckbox` `normalizeWS` `plainify` `itemKey`
-`backlinkBonus` `scoreEntry` `buildIndex`)는 `exports._internals`로 노출되어
+`itemLocation` `resolveLine` `backlinkBonus` `scoreEntry` `buildIndex`)는
+`exports._internals`로 노출되어
 `npm test`에서 검증됩니다. Obsidian은 `exports.default`만 읽으므로 영향이 없습니다.
 
 ---
@@ -185,7 +205,8 @@ TasksAncestorPlugin (extends obsidian.Plugin)
 
 | 항목 | 설명 |
 |------|------|
-| 조상 항목 인터랙션 | 조상 `<li>`의 체크박스는 읽기전용입니다. 토글하려면 원본 노트에서 직접 수정하세요. |
+| 조상 항목 인터랙션 | 조상 `<li>`의 체크박스는 읽기전용입니다. 토글하려면 텍스트를 클릭해 원본으로 이동한 뒤 수정하세요. |
+| 조상 이동 대상 | 위치를 못 읽는 항목(`taskLocation` 없음)은 클릭해도 반응하지 않습니다. 커서가 바뀌지 않는 항목이 그렇습니다. |
 | 텍스트 매칭 한계 | 🆔가 있는 태스크는 결정적으로 매칭됩니다. 🆔가 없고 동일한 설명의 태스크가 여러 파일에 있으면 잘못 매칭될 수 있습니다(백링크 파일명·헤딩으로 보정하지만 100%는 아닙니다). |
 | Global Filter | Tasks 플러그인의 Global Filter가 설정되어 있으면 렌더된 텍스트와 원본 마크다운 간 차이가 발생할 수 있습니다. |
 | 조상 렌더링 | 조상 항목은 plain text로 표시됩니다. Tasks 플러그인처럼 날짜 이모지나 우선순위 표시는 제공하지 않습니다. |
@@ -211,6 +232,11 @@ TasksAncestorPlugin (extends obsidian.Plugin)
 /* 조상 체크박스 숨기기 (원하는 경우) */
 .tasks-ancestor-item .task-list-item-checkbox {
     display: none;
+}
+
+/* 클릭해서 원본으로 갈 수 있는 조상만 별도 표시 */
+.tasks-ancestor-clickable .tasks-ancestor-label:hover {
+    color: var(--text-accent);
 }
 ```
 
@@ -300,6 +326,7 @@ MIT
 
 | 버전 | 날짜 | 변경 사항 |
 |------|------|----------|
+| 2.2.0 | 2026-08 | 조상 항목 클릭 → 원본 줄로 이동(Ctrl/가운데 클릭 지원, 원문 대조로 줄 번호 보정) |
 | 2.1.0 | 2026-08 | 🆔 우선 2-pass 매칭, 마크다운 링크 설명 정규화, 중첩 `<li>` 오염·조상 잔재 누적·언로드 시 observer 누수 수정, 매칭 인덱스화, 순수함수 테스트 추가 |
 | 2.0.2 | 2026-07 | 🆔 결정적 매칭(중복 렌더 수정), BRAT 독립 저장소 전환 |
 | 2.0.0 | 2026-03 | 전면 재설계: Tasks 렌더 위임 + parent 체인 순회 방식 |
