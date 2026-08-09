@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.5.0';
+var VERSION = '2.6.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -1012,10 +1012,10 @@ var AncestorRenderChild = (function (_super) {
             ? obsidian.Keymap.isModEvent(evt)
             : false;
 
-        // A new-tab gesture on a file that is already open goes to that tab
-        // instead of making a second copy of it. A plain click reuses the
-        // current tab anyway, so it never needs this.
-        var existing = newTab || mod ? findOpenLeaf(app.workspace, file.path) : null;
+        // Already open -> go to that tab, whatever the gesture was. A plain
+        // click would otherwise replace whatever sits in the current tab while
+        // the target is right there in another one.
+        var existing = findOpenLeaf(app.workspace, file.path);
         var leaf = existing || app.workspace.getLeaf(newTab ? 'tab' : mod);
 
         // A reused tab may still be deferred; loading it first keeps the
@@ -1070,7 +1070,8 @@ var AncestorSettingTab = (function (_super) {
             .setName('클릭하면 원본으로 이동')
             .setDesc(
                 '항목의 텍스트를 클릭하면 그 줄이 있는 노트를 엽니다. ' +
-                'Ctrl/Cmd+클릭과 가운데 클릭은 새 탭에서 열고, 이미 열려 있으면 그 탭으로 갑니다.'
+                '이미 열려 있는 노트면 그 탭으로 이동하고, 아니면 현재 탭에서 엽니다. ' +
+                'Ctrl/Cmd+클릭과 가운데 클릭은 새 탭에서 엽니다.'
             )
             .addToggle(function (t) {
                 t.setValue(s.clickToOpen).onChange(async function (v) {
