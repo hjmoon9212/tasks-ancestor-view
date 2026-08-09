@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.4.1';
+var VERSION = '2.4.2';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -392,7 +392,12 @@ var TasksAncestorPlugin = (function (_super) {
         var plugin = this;
         // Live render children, so a settings change can redraw open notes
         // instead of asking the user to reopen them.
-        this._children = new Set();
+        //
+        // Deliberately NOT named _children: that is Obsidian's own Component
+        // field (an array of child components). Shadowing it with a Set makes
+        // unload() throw on _children.slice(), which takes the whole plugin
+        // down when it is reloaded or updated.
+        this._renderChildren = new Set();
 
         await this.loadSettings();
         log('loaded');
@@ -425,16 +430,16 @@ var TasksAncestorPlugin = (function (_super) {
 
     /** Redraw every open block. Clearing the signature defeats the skip check. */
     TasksAncestorPlugin.prototype.refreshViews = function () {
-        if (!this._children) return;
-        this._children.forEach(function (child) { child.forceReprocess(); });
+        if (!this._renderChildren) return;
+        this._renderChildren.forEach(function (child) { child.forceReprocess(); });
     };
 
     TasksAncestorPlugin.prototype.trackChild = function (child) {
-        if (this._children) this._children.add(child);
+        if (this._renderChildren) this._renderChildren.add(child);
     };
 
     TasksAncestorPlugin.prototype.untrackChild = function (child) {
-        if (this._children) this._children.delete(child);
+        if (this._renderChildren) this._renderChildren.delete(child);
     };
 
     return TasksAncestorPlugin;
