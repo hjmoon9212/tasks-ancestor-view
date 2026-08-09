@@ -1,6 +1,6 @@
 {
   "name": "tasks-ancestor-view",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "Show only the ancestor chain of matching tasks. Companion plugin for Obsidian Tasks.",
   "private": true,
   "license": "MIT",

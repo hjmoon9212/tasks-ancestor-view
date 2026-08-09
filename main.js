@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.6.0';
+var VERSION = '2.7.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -1008,15 +1008,21 @@ var AncestorRenderChild = (function (_super) {
             console.error('Tasks Ancestor View v' + VERSION + ': source read failed', e);
         }
 
-        var mod = !newTab && obsidian.Keymap && obsidian.Keymap.isModEvent
-            ? obsidian.Keymap.isModEvent(evt)
-            : false;
+        // Every click opens a new tab. Clicking here means leaving a query
+        // view you probably want to keep, and Tasks' own backlink is already
+        // the "open in the current tab" gesture on the same row.
+        //
+        // A modifier can still ask for something other than a tab: isModEvent()
+        // answers 'tab' | 'split' | 'window' (or false for a bare click).
+        var pane = 'tab';
+        if (!newTab && obsidian.Keymap && obsidian.Keymap.isModEvent) {
+            var mod = obsidian.Keymap.isModEvent(evt);
+            if (typeof mod === 'string') pane = mod;
+        }
 
-        // Already open -> go to that tab, whatever the gesture was. A plain
-        // click would otherwise replace whatever sits in the current tab while
-        // the target is right there in another one.
+        // Already open -> go to that tab instead of opening a second copy.
         var existing = findOpenLeaf(app.workspace, file.path);
-        var leaf = existing || app.workspace.getLeaf(newTab ? 'tab' : mod);
+        var leaf = existing || app.workspace.getLeaf(pane);
 
         // A reused tab may still be deferred; loading it first keeps the
         // scroll-to-line reliable.
@@ -1069,9 +1075,9 @@ var AncestorSettingTab = (function (_super) {
         new obsidian.Setting(el)
             .setName('클릭하면 원본으로 이동')
             .setDesc(
-                '항목의 텍스트를 클릭하면 그 줄이 있는 노트를 엽니다. ' +
-                '이미 열려 있는 노트면 그 탭으로 이동하고, 아니면 현재 탭에서 엽니다. ' +
-                'Ctrl/Cmd+클릭과 가운데 클릭은 새 탭에서 엽니다.'
+                '항목의 텍스트를 클릭하면 그 줄이 있는 노트를 새 탭에서 엽니다. ' +
+                '이미 열려 있는 노트면 새로 열지 않고 그 탭으로 이동합니다. ' +
+                '현재 탭에서 열려면 태스크 줄의 백링크를 쓰세요.'
             )
             .addToggle(function (t) {
                 t.setValue(s.clickToOpen).onChange(async function (v) {
