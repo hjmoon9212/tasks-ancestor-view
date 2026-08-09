@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.4.0';
+var VERSION = '2.4.1';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -120,6 +120,22 @@ function itemKey(item) {
     return 'md:' + (item.originalMarkdown || '').trim() + '|' + path;
 }
 
+// The file a leaf is showing.
+//
+// A background tab can be *deferred* (Obsidian 1.7.2+): the leaf still reports
+// type markdown, but its view is a DeferredView, so `view.file` is undefined.
+// The view state carries the path in both states, so read that first.
+function leafFilePath(leaf) {
+    if (!leaf) return '';
+    if (typeof leaf.getViewState === 'function') {
+        var st = leaf.getViewState();
+        var f = st && st.state && st.state.file;
+        if (typeof f === 'string' && f) return f;
+    }
+    var view = leaf.view;
+    return (view && view.file && view.file.path) || '';
+}
+
 // The tab already showing `path` in the main workspace, or null.
 //
 // Sidebars and pop-out windows are deliberately excluded: a click that throws
@@ -129,21 +145,41 @@ function itemKey(item) {
 // (a per-leaf timestamp is not public API), so when that leaf is not one of our
 // matches - the usual case, since the note you clicked *from* is the recent one
 // - we fall back to the first match in tab order.
+function allLeaves(workspace) {
+    // iterateAllLeaves first: getLeavesOfType() filters on the *loaded* view
+    // type, so a deferred background tab can be missing from it entirely.
+    if (typeof workspace.iterateAllLeaves === 'function') {
+        var out = [];
+        workspace.iterateAllLeaves(function (leaf) { out.push(leaf); });
+        return out;
+    }
+    if (typeof workspace.getLeavesOfType === 'function') {
+        return workspace.getLeavesOfType('markdown') || [];
+    }
+    return [];
+}
+
 function findOpenLeaf(workspace, path) {
-    if (!workspace || typeof workspace.getLeavesOfType !== 'function') return null;
+    if (!workspace) return null;
 
     var root = workspace.rootSplit;
-    var leaves = workspace.getLeavesOfType('markdown') || [];
+    var leaves = allLeaves(workspace);
     var matches = [];
+    var offRoot = 0;
     for (var i = 0; i < leaves.length; i++) {
         var leaf = leaves[i];
-        var view = leaf && leaf.view;
-        if (!view || !view.file || view.file.path !== path) continue;
+        if (leafFilePath(leaf) !== path) continue;
         // No getRoot (older API) -> do not exclude. An extra tab is a smaller
         // failure than never matching at all.
-        if (root && typeof leaf.getRoot === 'function' && leaf.getRoot() !== root) continue;
+        if (root && typeof leaf.getRoot === 'function' && leaf.getRoot() !== root) {
+            offRoot++;
+            continue;
+        }
         matches.push(leaf);
     }
+    log('findOpenLeaf: ' + leaves.length + ' leaf/leaves scanned, ' + matches.length +
+        ' match(es)' + (offRoot ? ', ' + offRoot + ' outside main workspace' : '') +
+        ' for ' + path);
     if (!matches.length) return null;
 
     var recent = typeof workspace.getMostRecentLeaf === 'function'
@@ -867,6 +903,11 @@ var AncestorRenderChild = (function (_super) {
         // backlink. Make the label open its source line instead, so it behaves
         // like the matched tasks around it.
         var loc = this._settings().clickToOpen ? itemLocation(item) : null;
+        if (!loc && this._settings().clickToOpen) {
+            // No location -> no click handler and no pointer cursor. Worth
+            // saying out loud; otherwise it reads as "clicking is broken".
+            log('no source location for ancestor: ' + JSON.stringify(desc).slice(0, 60));
+        }
         if (loc) {
             var self = this;
             li.classList.add('tasks-ancestor-clickable');
@@ -928,6 +969,12 @@ var AncestorRenderChild = (function (_super) {
         // current tab anyway, so it never needs this.
         var existing = newTab || mod ? findOpenLeaf(app.workspace, file.path) : null;
         var leaf = existing || app.workspace.getLeaf(newTab ? 'tab' : mod);
+
+        // A reused tab may still be deferred; loading it first keeps the
+        // scroll-to-line reliable.
+        if (existing && typeof existing.loadIfDeferred === 'function') {
+            await existing.loadIfDeferred();
+        }
 
         await leaf.openFile(file, { eState: { line: line } });
         if (existing) {
@@ -1037,6 +1084,7 @@ exports._internals = {
     mergeSettings: mergeSettings,
     itemLocation: itemLocation,
     resolveLine: resolveLine,
+    leafFilePath: leafFilePath,
     findOpenLeaf: findOpenLeaf,
     backlinkBonus: backlinkBonus,
     scoreEntry: scoreEntry,

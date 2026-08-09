@@ -96,14 +96,25 @@ test('resolveLine tolerates a hint past the end of the file', () => {
 // making a duplicate. Everything here is stubbed - the real Workspace only
 // exposes `getMostRecentLeaf` for recency, so the fallbacks matter.
 
-const { findOpenLeaf } = require('../main.js')._internals;
+const { findOpenLeaf, leafFilePath } = require('../main.js')._internals;
 
 const ROOT = { id: 'rootSplit' };
 const SIDEBAR = { id: 'leftSplit' };
 
-/** @param root the WorkspaceItem this leaf reports; omit to simulate an old API. */
+/** A loaded tab: the view carries the TFile. */
 function leaf(path, root) {
     const l = { view: path === null ? {} : { file: { path } } };
+    if (root !== undefined) l.getRoot = () => root;
+    return l;
+}
+
+/** A deferred background tab: DeferredView, so only the view state has the path. */
+function deferredLeaf(path, root) {
+    const l = {
+        view: {},
+        isDeferred: true,
+        getViewState: () => ({ type: 'markdown', state: { file: path } }),
+    };
     if (root !== undefined) l.getRoot = () => root;
     return l;
 }
@@ -111,10 +122,27 @@ function leaf(path, root) {
 function workspace(leaves, mostRecent) {
     return {
         rootSplit: ROOT,
-        getLeavesOfType: () => leaves,
+        iterateAllLeaves: (cb) => (leaves || []).forEach(cb),
         getMostRecentLeaf: () => mostRecent ?? null,
     };
 }
+
+// ---------------------------------------------------------------- leafFilePath
+test('leafFilePath reads a loaded view', () => {
+    assert.equal(leafFilePath(leaf('a.md', ROOT)), 'a.md');
+});
+
+test('leafFilePath reads a deferred tab from its view state', () => {
+    // The whole point: view.file is undefined until the tab is opened once.
+    assert.equal(leafFilePath(deferredLeaf('a.md', ROOT)), 'a.md');
+});
+
+test('leafFilePath returns empty for a leaf with no file', () => {
+    assert.equal(leafFilePath(null), '');
+    assert.equal(leafFilePath({}), '');
+    assert.equal(leafFilePath({ view: {} }), '');
+    assert.equal(leafFilePath({ getViewState: () => ({ type: 'graph' }) }), '');
+});
 
 test('findOpenLeaf returns null when the file is not open', () => {
     assert.equal(findOpenLeaf(workspace([leaf('other.md', ROOT)]), 'a.md'), null);
@@ -165,4 +193,21 @@ test('findOpenLeaf tolerates a missing or empty workspace', () => {
     assert.equal(findOpenLeaf(null, 'a.md'), null);
     assert.equal(findOpenLeaf({}, 'a.md'), null);
     assert.equal(findOpenLeaf({ rootSplit: ROOT, getLeavesOfType: () => null }, 'a.md'), null);
+});
+
+test('findOpenLeaf matches a deferred background tab', () => {
+    // Regression guard for v2.4.0: matching on view.file missed every tab the
+    // user had not opened since Obsidian started, so reuse never triggered.
+    const hit = deferredLeaf('a.md', ROOT);
+    assert.equal(findOpenLeaf(workspace([hit]), 'a.md'), hit);
+});
+
+test('findOpenLeaf excludes a deferred tab outside the main workspace', () => {
+    assert.equal(findOpenLeaf(workspace([deferredLeaf('a.md', SIDEBAR)]), 'a.md'), null);
+});
+
+test('findOpenLeaf falls back to getLeavesOfType on an older API', () => {
+    const hit = leaf('a.md', ROOT);
+    const ws = { rootSplit: ROOT, getLeavesOfType: () => [hit] };
+    assert.equal(findOpenLeaf(ws, 'a.md'), hit);
 });
