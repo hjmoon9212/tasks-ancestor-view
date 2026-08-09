@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.3.0';
+var VERSION = '2.4.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -118,6 +118,38 @@ function itemKey(item) {
     // 3) Last-resort fallback - collapses items with identical text in same
     //    file, which is acceptable since they would render identically anyway.
     return 'md:' + (item.originalMarkdown || '').trim() + '|' + path;
+}
+
+// The tab already showing `path` in the main workspace, or null.
+//
+// Sidebars and pop-out windows are deliberately excluded: a click that throws
+// focus to another window is more surprising than a second tab.
+//
+// Recency is best effort. Obsidian only exposes "the most recent leaf" overall
+// (a per-leaf timestamp is not public API), so when that leaf is not one of our
+// matches - the usual case, since the note you clicked *from* is the recent one
+// - we fall back to the first match in tab order.
+function findOpenLeaf(workspace, path) {
+    if (!workspace || typeof workspace.getLeavesOfType !== 'function') return null;
+
+    var root = workspace.rootSplit;
+    var leaves = workspace.getLeavesOfType('markdown') || [];
+    var matches = [];
+    for (var i = 0; i < leaves.length; i++) {
+        var leaf = leaves[i];
+        var view = leaf && leaf.view;
+        if (!view || !view.file || view.file.path !== path) continue;
+        // No getRoot (older API) -> do not exclude. An extra tab is a smaller
+        // failure than never matching at all.
+        if (root && typeof leaf.getRoot === 'function' && leaf.getRoot() !== root) continue;
+        matches.push(leaf);
+    }
+    if (!matches.length) return null;
+
+    var recent = typeof workspace.getMostRecentLeaf === 'function'
+        ? workspace.getMostRecentLeaf(root)
+        : null;
+    return recent && matches.indexOf(recent) !== -1 ? recent : matches[0];
 }
 
 // Keep the debounce usable. data.json is hand-editable and a stray value
@@ -890,8 +922,20 @@ var AncestorRenderChild = (function (_super) {
         var mod = !newTab && obsidian.Keymap && obsidian.Keymap.isModEvent
             ? obsidian.Keymap.isModEvent(evt)
             : false;
-        var leaf = app.workspace.getLeaf(newTab ? 'tab' : mod);
+
+        // A new-tab gesture on a file that is already open goes to that tab
+        // instead of making a second copy of it. A plain click reuses the
+        // current tab anyway, so it never needs this.
+        var existing = newTab || mod ? findOpenLeaf(app.workspace, file.path) : null;
+        var leaf = existing || app.workspace.getLeaf(newTab ? 'tab' : mod);
+
         await leaf.openFile(file, { eState: { line: line } });
+        if (existing) {
+            // openFile applies the eState but does not necessarily surface the
+            // tab it was already sitting in.
+            await app.workspace.revealLeaf(leaf);
+            app.workspace.setActiveLeaf(leaf, { focus: true });
+        }
     };
 
     return AncestorRenderChild;
@@ -993,6 +1037,7 @@ exports._internals = {
     mergeSettings: mergeSettings,
     itemLocation: itemLocation,
     resolveLine: resolveLine,
+    findOpenLeaf: findOpenLeaf,
     backlinkBonus: backlinkBonus,
     scoreEntry: scoreEntry,
     buildIndex: buildIndex

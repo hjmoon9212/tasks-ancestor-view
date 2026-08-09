@@ -90,3 +90,79 @@ test('resolveLine tolerates a hint past the end of the file', () => {
     assert.equal(resolveLine(LINES, '- [ ] #task alpha', 99), 1);
     assert.equal(resolveLine(LINES, '- [ ] #task gone', 99), 99);
 });
+
+// ---------------------------------------------------------------- findOpenLeaf
+// A new-tab gesture on an already-open file should land on that tab instead of
+// making a duplicate. Everything here is stubbed - the real Workspace only
+// exposes `getMostRecentLeaf` for recency, so the fallbacks matter.
+
+const { findOpenLeaf } = require('../main.js')._internals;
+
+const ROOT = { id: 'rootSplit' };
+const SIDEBAR = { id: 'leftSplit' };
+
+/** @param root the WorkspaceItem this leaf reports; omit to simulate an old API. */
+function leaf(path, root) {
+    const l = { view: path === null ? {} : { file: { path } } };
+    if (root !== undefined) l.getRoot = () => root;
+    return l;
+}
+
+function workspace(leaves, mostRecent) {
+    return {
+        rootSplit: ROOT,
+        getLeavesOfType: () => leaves,
+        getMostRecentLeaf: () => mostRecent ?? null,
+    };
+}
+
+test('findOpenLeaf returns null when the file is not open', () => {
+    assert.equal(findOpenLeaf(workspace([leaf('other.md', ROOT)]), 'a.md'), null);
+    assert.equal(findOpenLeaf(workspace([]), 'a.md'), null);
+});
+
+test('findOpenLeaf finds the tab holding the file', () => {
+    const hit = leaf('a.md', ROOT);
+    assert.equal(findOpenLeaf(workspace([leaf('other.md', ROOT), hit]), 'a.md'), hit);
+});
+
+test('findOpenLeaf ignores sidebars and pop-out windows', () => {
+    // Yanking focus to another window is worse than opening a second tab.
+    assert.equal(findOpenLeaf(workspace([leaf('a.md', SIDEBAR)]), 'a.md'), null);
+});
+
+test('findOpenLeaf prefers the most recent tab when it is one of the matches', () => {
+    const first = leaf('a.md', ROOT);
+    const recent = leaf('a.md', ROOT);
+    assert.equal(findOpenLeaf(workspace([first, recent], recent), 'a.md'), recent);
+});
+
+test('findOpenLeaf falls back to tab order when the recent leaf is unrelated', () => {
+    // The usual case: the most recent leaf is the note you clicked *from*.
+    const first = leaf('a.md', ROOT);
+    const second = leaf('a.md', ROOT);
+    const elsewhere = leaf('b.md', ROOT);
+    assert.equal(findOpenLeaf(workspace([first, second], elsewhere), 'a.md'), first);
+});
+
+test('findOpenLeaf skips leaves with no file', () => {
+    const hit = leaf('a.md', ROOT);
+    assert.equal(findOpenLeaf(workspace([leaf(null, ROOT), hit]), 'a.md'), hit);
+});
+
+test('findOpenLeaf does not exclude leaves from an API without getRoot', () => {
+    const hit = leaf('a.md');   // no getRoot
+    assert.equal(findOpenLeaf(workspace([hit]), 'a.md'), hit);
+});
+
+test('findOpenLeaf survives a workspace without getMostRecentLeaf', () => {
+    const hit = leaf('a.md', ROOT);
+    const ws = { rootSplit: ROOT, getLeavesOfType: () => [hit] };
+    assert.equal(findOpenLeaf(ws, 'a.md'), hit);
+});
+
+test('findOpenLeaf tolerates a missing or empty workspace', () => {
+    assert.equal(findOpenLeaf(null, 'a.md'), null);
+    assert.equal(findOpenLeaf({}, 'a.md'), null);
+    assert.equal(findOpenLeaf({ rootSplit: ROOT, getLeavesOfType: () => null }, 'a.md'), null);
+});
