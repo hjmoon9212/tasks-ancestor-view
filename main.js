@@ -18,10 +18,27 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.2.0';
+var VERSION = '2.3.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
+
+var DEFAULT_SETTINGS = {
+    // Tasks re-renders in bursts; we wait for the burst to settle before
+    // rebuilding the tree. Too low rebuilds mid-render, too high visibly lags.
+    debounceMs: 400,
+    // Expand what lives *under* a matched task too (plain checkboxes and list
+    // items that are not #task). Off = ancestor chain only.
+    showDescendants: true,
+    // Clicking an ancestor's label opens its source line.
+    clickToOpen: true,
+    // Per-pass console logging.
+    debug: false,
+};
+
+// Mirrors settings.debug for the module-level log(). The plugin is a single
+// instance, so a module-level flag beats threading settings through every call.
+var debugFlag = false;
 
 // require() is wrapped so this file can also be loaded by `node --test`,
 // where the 'obsidian' module does not exist. Only the pure helpers at the
@@ -32,9 +49,11 @@ var obsidian = (function () {
 })();
 
 // --- logging --------------------------------------------------------
-// Rendering happens on every Tasks re-render, so per-pass logs are opt-in:
-//   localStorage.setItem('tav-debug', '1')   in the developer console.
+// Rendering happens on every Tasks re-render, so per-pass logs are opt-in.
+// Two ways in: the setting, or localStorage on a device with no settings UI
+// handy (`localStorage.setItem('tav-debug', '1')` in the developer console).
 function debugEnabled() {
+    if (debugFlag) return true;
     try {
         return typeof localStorage !== 'undefined' && !!localStorage.getItem('tav-debug');
     } catch (e) {
@@ -99,6 +118,25 @@ function itemKey(item) {
     // 3) Last-resort fallback - collapses items with identical text in same
     //    file, which is acceptable since they would render identically anyway.
     return 'md:' + (item.originalMarkdown || '').trim() + '|' + path;
+}
+
+// Keep the debounce usable. data.json is hand-editable and a stray value
+// (0, "", "abc") would either spin or freeze the view.
+function clampDebounce(value, fallback) {
+    var n = typeof value === 'number' ? value : parseInt(value, 10);
+    if (!isFinite(n)) return fallback;
+    return Math.min(5000, Math.max(50, Math.round(n)));
+}
+
+// Saved settings merged onto the defaults and coerced. A missing key means
+// "default"; the booleans default to on, so only an explicit false turns them off.
+function mergeSettings(saved) {
+    var s = Object.assign({}, DEFAULT_SETTINGS, saved || {});
+    s.debounceMs = clampDebounce(s.debounceMs, DEFAULT_SETTINGS.debounceMs);
+    s.showDescendants = s.showDescendants !== false;
+    s.clickToOpen = s.clickToOpen !== false;
+    s.debug = !!s.debug;
+    return s;
 }
 
 // Source location of a Task / ListItem, or null when it cannot be determined.
@@ -229,6 +267,36 @@ function ownQuery(li, sel) {
     return null;
 }
 
+// Remove any nested <ul> children from an <li> - prevents accumulating
+// stale descendant lists across re-render passes.
+function stripNestedUls(li) {
+    var uls = [];
+    for (var i = 0; i < li.children.length; i++) {
+        if (li.children[i].tagName === 'UL') uls.push(li.children[i]);
+    }
+    for (var j = 0; j < uls.length; j++) li.removeChild(uls[j]);
+}
+
+// Undo our own tree, back to the flat list Tasks rendered.
+//
+// Our ancestor <li>s hold the matched <li>s inside a nested <ul>. Deleting the
+// ancestors alone would take those matches down with them and leave an empty
+// list until Tasks re-renders. So lift every <li> that is NOT ours back to the
+// top level, in document order, and drop the rest.
+function flattenOurTree(ul) {
+    if (!ul.querySelector('li[data-tav="ancestor"]')) return;
+
+    var all = ul.querySelectorAll('li');
+    var keep = [];
+    for (var i = 0; i < all.length; i++) {
+        if (all[i].getAttribute('data-tav') !== 'ancestor') keep.push(all[i]);
+    }
+    // Collected before any detaching, so removing a parent cannot lose a child.
+    for (var k = 0; k < keep.length; k++) stripNestedUls(keep[k]);
+    while (ul.firstChild) ul.removeChild(ul.firstChild);
+    for (var j = 0; j < keep.length; j++) ul.appendChild(keep[j]);
+}
+
 // Cheap fingerprint of a <ul>'s direct children, used to skip re-processing
 // a list we already restructured and nobody has touched since.
 function ulSignature(ul) {
@@ -252,13 +320,20 @@ var TasksAncestorPlugin = (function (_super) {
     TasksAncestorPlugin.prototype.constructor = TasksAncestorPlugin;
     function TasksAncestorPlugin() { return _super.apply(this, arguments) || this; }
 
-    TasksAncestorPlugin.prototype.onload = function () {
+    TasksAncestorPlugin.prototype.onload = async function () {
         var plugin = this;
+        // Live render children, so a settings change can redraw open notes
+        // instead of asking the user to reopen them.
+        this._children = new Set();
+
+        await this.loadSettings();
         log('loaded');
+
+        this.addSettingTab(new AncestorSettingTab(this.app, this));
 
         this.registerMarkdownCodeBlockProcessor('tasks-ancestors', function (source, el, ctx) {
             plugin.app.workspace.onLayoutReady(function () {
-                var child = new AncestorRenderChild(plugin.app, el, source, ctx);
+                var child = new AncestorRenderChild(plugin, el, source, ctx);
                 ctx.addChild(child);
                 child.load();
             });
@@ -269,6 +344,31 @@ var TasksAncestorPlugin = (function (_super) {
         log('unloaded');
     };
 
+    TasksAncestorPlugin.prototype.loadSettings = async function () {
+        this.settings = mergeSettings(await this.loadData());
+        debugFlag = this.settings.debug;
+    };
+
+    TasksAncestorPlugin.prototype.saveSettings = async function () {
+        debugFlag = this.settings.debug;
+        await this.saveData(this.settings);
+        this.refreshViews();
+    };
+
+    /** Redraw every open block. Clearing the signature defeats the skip check. */
+    TasksAncestorPlugin.prototype.refreshViews = function () {
+        if (!this._children) return;
+        this._children.forEach(function (child) { child.forceReprocess(); });
+    };
+
+    TasksAncestorPlugin.prototype.trackChild = function (child) {
+        if (this._children) this._children.add(child);
+    };
+
+    TasksAncestorPlugin.prototype.untrackChild = function (child) {
+        if (this._children) this._children.delete(child);
+    };
+
     return TasksAncestorPlugin;
 }(obsidian.Plugin || function () {}));
 
@@ -277,9 +377,10 @@ var AncestorRenderChild = (function (_super) {
     AncestorRenderChild.prototype = Object.create(_super.prototype);
     AncestorRenderChild.prototype.constructor = AncestorRenderChild;
 
-    function AncestorRenderChild(app, containerEl, source, ctx) {
+    function AncestorRenderChild(plugin, containerEl, source, ctx) {
         var _this = _super.call(this, containerEl) || this;
-        _this._app = app;
+        _this._plugin = plugin;
+        _this._app = plugin.app;
         _this._source = source;
         _this._ctx = ctx;
         _this._observer = null;
@@ -289,9 +390,24 @@ var AncestorRenderChild = (function (_super) {
         return _this;
     }
 
+    // Read through to the plugin every time - settings can change while the
+    // block is open, and the fallback keeps a detached child from throwing.
+    AncestorRenderChild.prototype._settings = function () {
+        return (this._plugin && this._plugin.settings) || DEFAULT_SETTINGS;
+    };
+
+    /** Settings changed - rebuild now instead of waiting for a Tasks re-render. */
+    AncestorRenderChild.prototype.forceReprocess = function () {
+        if (this._unloaded || !this.containerEl) return;
+        var uls = this.containerEl.querySelectorAll('ul.plugin-tasks-query-result');
+        for (var i = 0; i < uls.length; i++) uls[i].removeAttribute('data-tav-sig');
+        this._processResults();
+    };
+
     // -- lifecycle ---------------------------------------------------
     AncestorRenderChild.prototype.onload = function () {
         var self = this;
+        if (this._plugin) this._plugin.trackChild(this);
 
         var tasksPlugin = this._app.plugins && this._app.plugins.plugins &&
             this._app.plugins.plugins['obsidian-tasks-plugin'];
@@ -334,13 +450,17 @@ var AncestorRenderChild = (function (_super) {
         // Watch for render completion / re-renders.
         this._observer = new MutationObserver(function () {
             clearTimeout(self._timeout);
-            self._timeout = setTimeout(function () { self._processResults(); }, 400);
+            self._timeout = setTimeout(
+                function () { self._processResults(); },
+                self._settings().debounceMs
+            );
         });
         this._observer.observe(this.containerEl, { childList: true, subtree: true, characterData: true });
     };
 
     AncestorRenderChild.prototype.onunload = function () {
         this._unloaded = true;
+        if (this._plugin) this._plugin.untrackChild(this);
         if (this._observer) this._observer.disconnect();
         this._observer = null;
         clearTimeout(this._timeout);
@@ -402,15 +522,10 @@ var AncestorRenderChild = (function (_super) {
         // unrelated mutation, which flickers.
         if (ul.getAttribute('data-tav-sig') === ulSignature(ul)) return;
 
-        // Drop ancestor <li>s left over from an earlier pass. They carry the
-        // task-list-item class but no .tasks-list-text, so they would fall
-        // through matching into `unmatched` and pile up at the end of the list.
-        var stale = [];
-        for (var s = 0; s < ul.children.length; s++) {
-            var staleEl = ul.children[s];
-            if (staleEl.getAttribute && staleEl.getAttribute('data-tav') === 'ancestor') stale.push(staleEl);
-        }
-        for (var d = 0; d < stale.length; d++) ul.removeChild(stale[d]);
+        // Back to flat before matching. Ancestor <li>s from an earlier pass
+        // carry the task-list-item class but no .tasks-list-text, so left in
+        // place they fall through matching and pile up at the end of the list.
+        flattenOurTree(ul);
 
         // 1) Gather <li> elements that are direct children + task items.
         var directLis = [];
@@ -589,20 +704,12 @@ var AncestorRenderChild = (function (_super) {
             // (without #task) and plain `-` list items that live under this
             // task in the source. itemKey-based merging means descendants that
             // are themselves matched leaves collapse onto their existing node.
-            this._attachDescendants(node, task, 0, new Set());
+            if (this._settings().showDescendants) {
+                this._attachDescendants(node, task, 0, new Set());
+            }
         }
 
         return root;
-    };
-
-    // Remove any nested <ul> children from an <li> - prevents accumulating
-    // stale descendant lists across re-render passes.
-    AncestorRenderChild.prototype._stripNestedUls = function (li) {
-        var uls = [];
-        for (var i = 0; i < li.children.length; i++) {
-            if (li.children[i].tagName === 'UL') uls.push(li.children[i]);
-        }
-        for (var j = 0; j < uls.length; j++) li.removeChild(uls[j]);
     };
 
     // -- descendants -------------------------------------------------
@@ -653,7 +760,7 @@ var AncestorRenderChild = (function (_super) {
                 // handlers (checkbox toggle, backlink click) survive the move.
                 li = child.matchedLi;
                 // Strip any stale nested UL left over from a prior render pass.
-                this._stripNestedUls(li);
+                stripNestedUls(li);
                 li.setAttribute('data-tav', 'match');
             } else {
                 // Pure ancestor (not a matching task) -> create a new <li>.
@@ -727,7 +834,7 @@ var AncestorRenderChild = (function (_super) {
         // An ancestor is context, not a query result, so Tasks gives it no
         // backlink. Make the label open its source line instead, so it behaves
         // like the matched tasks around it.
-        var loc = itemLocation(item);
+        var loc = this._settings().clickToOpen ? itemLocation(item) : null;
         if (loc) {
             var self = this;
             li.classList.add('tasks-ancestor-clickable');
@@ -790,6 +897,86 @@ var AncestorRenderChild = (function (_super) {
     return AncestorRenderChild;
 }(obsidian.MarkdownRenderChild || function () {}));
 
+// --- Settings tab ---------------------------------------------------
+var AncestorSettingTab = (function (_super) {
+    AncestorSettingTab.prototype = Object.create(_super.prototype);
+    AncestorSettingTab.prototype.constructor = AncestorSettingTab;
+
+    function AncestorSettingTab(app, plugin) {
+        var _this = _super.call(this, app, plugin) || this;
+        _this.plugin = plugin;
+        return _this;
+    }
+
+    AncestorSettingTab.prototype.display = function () {
+        var plugin = this.plugin;
+        var s = plugin.settings;
+        var el = this.containerEl;
+        el.empty();
+
+        new obsidian.Setting(el)
+            .setName('하위 항목도 함께 표시')
+            .setDesc(
+                '매칭된 태스크 아래에 달린 하위 항목(#task가 아닌 체크박스·일반 목록)까지 ' +
+                '트리에 펼칩니다. 끄면 조상 체인만 남습니다.'
+            )
+            .addToggle(function (t) {
+                t.setValue(s.showDescendants).onChange(async function (v) {
+                    s.showDescendants = v;
+                    await plugin.saveSettings();
+                });
+            });
+
+        new obsidian.Setting(el)
+            .setName('조상 클릭 시 원본으로 이동')
+            .setDesc(
+                '조상 항목의 텍스트를 클릭하면 그 줄이 있는 노트를 엽니다. ' +
+                'Ctrl/Cmd+클릭과 가운데 클릭은 새 탭에서 엽니다.'
+            )
+            .addToggle(function (t) {
+                t.setValue(s.clickToOpen).onChange(async function (v) {
+                    s.clickToOpen = v;
+                    await plugin.saveSettings();
+                });
+            });
+
+        new obsidian.Setting(el)
+            .setName('재구성 대기 시간')
+            .setDesc(
+                'Tasks가 목록을 다시 그린 뒤 트리를 재구성하기까지 기다리는 시간(ms). ' +
+                '짧으면 반응이 빠르고, 길면 렌더가 끝나기를 더 확실히 기다립니다. ' +
+                '50~5000 범위로 보정되며 기본값은 400입니다.'
+            )
+            .addText(function (t) {
+                t.setPlaceholder(String(DEFAULT_SETTINGS.debounceMs))
+                    .setValue(String(s.debounceMs))
+                    .onChange(async function (v) {
+                        // display()를 다시 부르지 않는다 - 입력 중 재렌더하면 포커스가 날아간다.
+                        // 화면의 값은 그대로 두고 저장되는 값만 범위 안으로 보정한다.
+                        var n = parseInt(v, 10);
+                        if (!isFinite(n)) return;
+                        s.debounceMs = clampDebounce(n, DEFAULT_SETTINGS.debounceMs);
+                        await plugin.saveSettings();
+                    });
+            });
+
+        new obsidian.Setting(el)
+            .setName('디버그 로그')
+            .setDesc(
+                '매칭 결과와 소요 시간을 개발자 콘솔에 출력합니다. ' +
+                "설정을 열기 어려운 기기에서는 콘솔에서 localStorage.setItem('tav-debug','1')로도 켤 수 있습니다."
+            )
+            .addToggle(function (t) {
+                t.setValue(s.debug).onChange(async function (v) {
+                    s.debug = v;
+                    await plugin.saveSettings();
+                });
+            });
+    };
+
+    return AncestorSettingTab;
+}(obsidian.PluginSettingTab || function () {}));
+
 // --- export (Obsidian expects CJS default export) -------------------
 Object.defineProperty(exports, '__esModule', { value: true });
 exports.default = TasksAncestorPlugin;
@@ -801,6 +988,9 @@ exports._internals = {
     normalizeWS: normalizeWS,
     plainify: plainify,
     itemKey: itemKey,
+    DEFAULT_SETTINGS: DEFAULT_SETTINGS,
+    clampDebounce: clampDebounce,
+    mergeSettings: mergeSettings,
     itemLocation: itemLocation,
     resolveLine: resolveLine,
     backlinkBonus: backlinkBonus,

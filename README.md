@@ -103,6 +103,21 @@ group by filename
 
 ---
 
+## 설정
+
+**설정 → 커뮤니티 플러그인 → Tasks Ancestor View**
+
+| 항목 | 기본값 | 설명 |
+|------|--------|------|
+| 하위 항목도 함께 표시 | 켜짐 | 매칭된 태스크 **아래**에 달린 항목(`#task`가 아닌 체크박스·일반 목록)까지 트리에 펼칩니다. 끄면 조상 체인만 남습니다. |
+| 조상 클릭 시 원본으로 이동 | 켜짐 | 끄면 조상 텍스트가 클릭에 반응하지 않고 커서도 바뀌지 않습니다. |
+| 재구성 대기 시간 | 400ms | Tasks가 목록을 다시 그린 뒤 트리를 재구성하기까지의 대기. 50~5000 범위로 보정됩니다. |
+| 디버그 로그 | 꺼짐 | 매칭 결과와 소요 시간을 콘솔에 출력합니다. |
+
+설정을 바꾸면 **열려 있는 노트가 즉시 다시 그려집니다** — 노트를 다시 열 필요 없습니다.
+
+---
+
 ## 동작 원리
 
 ```
@@ -161,6 +176,7 @@ tasks-ancestor-view/
 ├── package.json             ← 테스트 스크립트만 (의존성 없음)
 ├── tests/matching.test.js   ← 매칭 순수함수 단위 테스트
 ├── tests/navigation.test.js ← 위치 해석 순수함수 단위 테스트
+├── tests/settings.test.js   ← 설정 병합 순수함수 단위 테스트
 └── README.md                ← 이 문서
 ```
 
@@ -191,12 +207,16 @@ TasksAncestorPlugin (extends obsidian.Plugin)
     ├── _buildTree()       → parent 체인 → 가상 트리 노드 구축
     ├── _renderTree()      → 가상 트리 → DOM 렌더링
     ├── _createAncestorLi()→ 조상 항목 <li> 생성 (+ 클릭 핸들러)
-    └── _openSource()      → 원본 파일 열고 해당 줄로 이동
+    ├── _openSource()      → 원본 파일 열고 해당 줄로 이동
+    └── forceReprocess()   → 설정 변경 시 강제 재구성
+
+AncestorSettingTab (extends obsidian.PluginSettingTab)
+    └── display()          → 설정 4개. 입력 중 재렌더하지 않는다(포커스 유실 방지)
 ```
 
 모듈 최상위의 순수함수(`stripCheckbox` `normalizeWS` `plainify` `itemKey`
-`itemLocation` `resolveLine` `backlinkBonus` `scoreEntry` `buildIndex`)는
-`exports._internals`로 노출되어
+`itemLocation` `resolveLine` `backlinkBonus` `scoreEntry` `buildIndex`
+`clampDebounce` `mergeSettings`)는 `exports._internals`로 노출되어
 `npm test`에서 검증됩니다. Obsidian은 `exports.default`만 읽으므로 영향이 없습니다.
 
 ---
@@ -275,8 +295,9 @@ Tasks 플러그인 업데이트 시 이 플러그인에 영향 없습니다.
 
 ### 디버깅
 
-로그는 기본적으로 꺼져 있습니다(재렌더마다 출력되므로). 개발자 도구
-(Ctrl+Shift+I) 콘솔에서 켠 뒤 노트를 다시 열면 확인할 수 있습니다:
+로그는 기본적으로 꺼져 있습니다(재렌더마다 출력되므로). **설정의 "디버그 로그"** 를
+켜는 게 가장 간단하고, 설정을 열기 어려운 기기에서는 개발자 도구(Ctrl+Shift+I)
+콘솔에서 켠 뒤 노트를 다시 열어도 됩니다:
 
 ```javascript
 localStorage.setItem('tav-debug', '1');   // 끄기: localStorage.removeItem('tav-debug')
@@ -326,6 +347,7 @@ MIT
 
 | 버전 | 날짜 | 변경 사항 |
 |------|------|----------|
+| 2.3.0 | 2026-08 | 설정 탭(하위 항목 표시·클릭 이동·대기 시간·디버그 로그), 설정 변경 시 즉시 재구성, 재구성 시 트리를 평면으로 되돌리도록 수정 |
 | 2.2.0 | 2026-08 | 조상 항목 클릭 → 원본 줄로 이동(Ctrl/가운데 클릭 지원, 원문 대조로 줄 번호 보정) |
 | 2.1.0 | 2026-08 | 🆔 우선 2-pass 매칭, 마크다운 링크 설명 정규화, 중첩 `<li>` 오염·조상 잔재 누적·언로드 시 observer 누수 수정, 매칭 인덱스화, 순수함수 테스트 추가 |
 | 2.0.2 | 2026-07 | 🆔 결정적 매칭(중복 렌더 수정), BRAT 독립 저장소 전환 |
