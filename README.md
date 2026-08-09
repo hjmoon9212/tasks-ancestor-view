@@ -105,8 +105,8 @@ group by filename
                        ▼
 ┌─────────────────────────────────────────────────────────┐
 │  3. 매칭: 렌더된 <li> ↔ Task 객체                         │
-│     → getTasks()에서 전체 Task 목록 조회                    │
-│     → 텍스트 유사도 + 백링크 파일명으로 매칭                  │
+│     → getTasks() 결과를 1회 인덱싱 (id / 설명 / 파일명)      │
+│     → 1차: 🆔 완전일치(결정적) / 2차: 텍스트 + 백링크        │
 └──────────────────────┬──────────────────────────────────┘
                        ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -138,11 +138,16 @@ group by filename
 
 ```
 tasks-ancestor-view/
-├── main.js          ← 플러그인 전체 로직 (단일 파일, 빌드 불필요)
-├── manifest.json    ← Obsidian 플러그인 메타데이터
-├── styles.css       ← 스타일시트
-└── README.md        ← 이 문서
+├── main.js                  ← 플러그인 전체 로직 (단일 파일, 빌드 불필요)
+├── manifest.json            ← Obsidian 플러그인 메타데이터
+├── styles.css               ← 스타일시트
+├── package.json             ← 테스트 스크립트만 (의존성 없음)
+├── tests/matching.test.js   ← 매칭 순수함수 단위 테스트
+└── README.md                ← 이 문서
 ```
+
+릴리스 산출물은 `main.js` / `manifest.json` / `styles.css` / `versions.json` 4개입니다.
+`tests/`와 `package.json`은 저장소에만 있고 배포되지 않습니다.
 
 ### main.js 내부 구조
 
@@ -159,14 +164,20 @@ TasksAncestorPlugin (extends obsidian.Plugin)
     ├── onunload()         → Observer 해제, 타이머 정리
     │
     ├── _processResults()  → Observer 콜백 (debounced)
-    ├── _doProcess()       → 전체 <ul> 순회
-    ├── _processOneUl()    → <li> 매칭 → 트리 구축 → DOM 재구성
+    ├── _doProcess()       → 인덱스 1회 구축 → 전체 <ul> 순회
+    ├── _processOneUl()    → 잔재 제거 → 2-pass 매칭 → 트리 구축 → DOM 재구성
     │
-    ├── _matchLiToTask()   → 텍스트 유사도 + 백링크로 Task 객체 매칭
+    ├── _pickById()        → 🆔 완전일치 (결정적, 백링크로 tiebreak)
+    ├── _pickByText()      → 설명 완전일치 fast path → 전체 스캔
+    ├── _bestOf()          → 후보 풀에서 최고 점수 선택
     ├── _buildTree()       → parent 체인 → 가상 트리 노드 구축
     ├── _renderTree()      → 가상 트리 → DOM 렌더링
     └── _createAncestorLi()→ 조상 항목 <li> 생성
 ```
+
+모듈 최상위의 순수함수(`stripCheckbox` `normalizeWS` `plainify` `itemKey`
+`backlinkBonus` `scoreEntry` `buildIndex`)는 `exports._internals`로 노출되어
+`npm test`에서 검증됩니다. Obsidian은 `exports.default`만 읽으므로 영향이 없습니다.
 
 ---
 
@@ -175,7 +186,7 @@ TasksAncestorPlugin (extends obsidian.Plugin)
 | 항목 | 설명 |
 |------|------|
 | 조상 항목 인터랙션 | 조상 `<li>`의 체크박스는 읽기전용입니다. 토글하려면 원본 노트에서 직접 수정하세요. |
-| 텍스트 매칭 한계 | 동일한 설명의 태스크가 여러 파일에 있으면 잘못 매칭될 수 있습니다. 백링크 파일명으로 보정하지만 100%는 아닙니다. |
+| 텍스트 매칭 한계 | 🆔가 있는 태스크는 결정적으로 매칭됩니다. 🆔가 없고 동일한 설명의 태스크가 여러 파일에 있으면 잘못 매칭될 수 있습니다(백링크 파일명·헤딩으로 보정하지만 100%는 아닙니다). |
 | Global Filter | Tasks 플러그인의 Global Filter가 설정되어 있으면 렌더된 텍스트와 원본 마크다운 간 차이가 발생할 수 있습니다. |
 | 조상 렌더링 | 조상 항목은 plain text로 표시됩니다. Tasks 플러그인처럼 날짜 이모지나 우선순위 표시는 제공하지 않습니다. |
 
@@ -238,14 +249,31 @@ Tasks 플러그인 업데이트 시 이 플러그인에 영향 없습니다.
 
 ### 디버깅
 
-개발자 도구(Ctrl+Shift+I)에서 콘솔 로그를 확인할 수 있습니다:
+로그는 기본적으로 꺼져 있습니다(재렌더마다 출력되므로). 개발자 도구
+(Ctrl+Shift+I) 콘솔에서 켠 뒤 노트를 다시 열면 확인할 수 있습니다:
+
+```javascript
+localStorage.setItem('tav-debug', '1');   // 끄기: localStorage.removeItem('tav-debug')
+```
 
 ```
-Tasks Ancestor View v2: loaded
-Tasks Ancestor View v2: requesting flat render
-Tasks Ancestor View v2: processing 1 task list(s)
-Tasks Ancestor View v2: matched=5  unmatched=0
+Tasks Ancestor View v2.1.0: loaded
+Tasks Ancestor View v2.1.0: requesting flat render
+Tasks Ancestor View v2.1.0: processing 1 task list(s); indexed 2293/2400 tasks in 12ms
+Tasks Ancestor View v2.1.0: matched=5  unmatched=0  in 3ms
 ```
+
+`console.error`(처리 오류)는 플래그와 무관하게 항상 출력됩니다.
+
+### 테스트
+
+```bash
+npm test          # node --test tests/  (의존성 설치 불필요)
+npm run check     # node --check main.js
+```
+
+릴리스 워크플로도 같은 명령을 실행하며, 태그와 `manifest.json`의 `version`이
+어긋나거나 `versions.json`에 해당 항목이 없으면 릴리스를 만들지 않고 실패합니다.
 
 ### 사용하는 Tasks 플러그인 내부 API
 
@@ -272,6 +300,8 @@ MIT
 
 | 버전 | 날짜 | 변경 사항 |
 |------|------|----------|
+| 2.1.0 | 2026-08 | 🆔 우선 2-pass 매칭, 마크다운 링크 설명 정규화, 중첩 `<li>` 오염·조상 잔재 누적·언로드 시 observer 누수 수정, 매칭 인덱스화, 순수함수 테스트 추가 |
+| 2.0.2 | 2026-07 | 🆔 결정적 매칭(중복 렌더 수정), BRAT 독립 저장소 전환 |
 | 2.0.0 | 2026-03 | 전면 재설계: Tasks 렌더 위임 + parent 체인 순회 방식 |
 | 1.1.0 | 2026-03 | CJS 호환 수정, MutationObserver 무한루프 수정 |
 | 1.0.0 | 2026-03 | 최초 버전 (dual-render 방식, 폐기됨) |

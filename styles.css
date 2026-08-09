@@ -1,4 +1,10 @@
-/* Tasks Ancestor View – hide non-ancestor items */
-.tasks-ancestor-hidden {
-    display: none !important;
+/* Tasks Ancestor View - ancestor rows are context, not query results.
+   Low specificity on purpose so a vault CSS snippet can override. */
+.tasks-ancestor-item .tasks-ancestor-label {
+    color: var(--text-muted);
+}
+
+/* The ancestor checkbox mirrors the source line but is not clickable. */
+.tasks-ancestor-item .task-list-item-checkbox {
+    cursor: default;
 }

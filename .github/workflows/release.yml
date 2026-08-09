@@ -1,6 +1,6 @@
 name: Release Obsidian plugin
 
-# manifest.json 의 version 과 같은 태그(예: 2.0.2)를 push 하면
+# manifest.json 의 version 과 같은 태그(예: 2.1.0)를 push 하면
 # main.js / manifest.json / styles.css / versions.json 을 첨부한 GitHub Release 를 만든다.
 # 이 플러그인은 빌드 스텝이 없다(순수 JS 단일 파일) → main.js 를 그대로 첨부.
 # BRAT 가 이 Release 에서 플러그인을 내려받는다.
@@ -17,6 +17,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 태그와 manifest.json 이 어긋난 릴리스는 BRAT 가 조용히 잘못된 버전을
+      # 배포하게 되므로, 만들기 전에 막는다.
+      - name: Verify version metadata
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          manifest_version="$(node -p "require('./manifest.json').version")"
+          if [ "$tag" != "$manifest_version" ]; then
+            echo "::error::tag '$tag' does not match manifest.json version '$manifest_version'"
+            exit 1
+          fi
+          if [ -z "$(node -p "require('./versions.json')['$tag'] || ''")" ]; then
+            echo "::error::versions.json has no entry for '$tag'"
+            exit 1
+          fi
+          echo "version metadata ok: $tag"
+
+      - name: Syntax check and unit tests
+        run: |
+          node --check main.js
+          node --test tests/
 
       - name: Create release
         env:
