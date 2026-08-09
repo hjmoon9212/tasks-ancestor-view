@@ -128,6 +128,35 @@ group by filename
 
 ---
 
+## 블록 지시어
+
+코드블록 안에 아래 줄을 넣으면 **그 블록에만** 적용됩니다. 설정(전역)보다 우선합니다.
+
+| 지시어 | 뜻 |
+|--------|-----|
+| `ancestors depth N` | 조상을 매칭된 태스크 기준 N단계까지만 표시 (0 = 조상 없음) |
+| `hide ancestors` | `ancestors depth 0`과 같음 |
+| `show ancestors` | 조상 제한 해제(기본값) |
+| `hide descendants` / `show descendants` | 하위 항목 표시를 블록 단위로 켜고 끔 |
+
+````markdown
+```tasks-ancestors
+not done
+due today
+ancestors depth 2
+hide descendants
+```
+````
+
+깊은 계층에서 최상위 몇 단계가 늘 같아 의미가 없을 때 `ancestors depth`로 줄이면
+됩니다. 나머지 줄은 손대지 않고 Tasks에 그대로 넘기므로 쿼리 문법은 100% 그대로입니다.
+(`show tree` / `hide tree`는 예외로 제거됩니다 — Tasks가 직접 `<li>`를 중첩시키면
+매칭이 깨집니다. 트리는 이 플러그인이 만듭니다.)
+
+오타가 나면 조용히 무시하지 않고 블록 위에 빨간 글씨로 알려줍니다.
+
+---
+
 ## 동작 원리
 
 ```
@@ -187,6 +216,7 @@ tasks-ancestor-view/
 ├── tests/matching.test.js   ← 매칭 순수함수 단위 테스트
 ├── tests/navigation.test.js ← 위치 해석 순수함수 단위 테스트
 ├── tests/settings.test.js   ← 설정 병합 순수함수 단위 테스트
+├── tests/directives.test.js ← 블록 지시어 파싱 단위 테스트
 └── README.md                ← 이 문서
 ```
 
@@ -216,6 +246,7 @@ TasksAncestorPlugin (extends obsidian.Plugin)
     ├── _bestOf()          → 후보 풀에서 최고 점수 선택
     ├── _buildTree()       → parent 체인 → 가상 트리 노드 구축
     ├── _renderTree()      → 가상 트리 → DOM 렌더링
+    ├── _wantsDescendants()→ 블록 지시어 > 설정 순으로 하위 표시 여부 결정
     ├── _wireMatchedLi()   → 매칭 태스크 <li>에 클릭 핸들러 (1회 등록)
     ├── _createAncestorLi()→ 조상 항목 <li> 생성 (+ 클릭 핸들러)
     ├── _openSource()      → 원본 파일 열고 해당 줄로 이동
@@ -227,7 +258,8 @@ AncestorSettingTab (extends obsidian.PluginSettingTab)
 
 모듈 최상위의 순수함수(`stripCheckbox` `normalizeWS` `plainify` `itemKey`
 `itemLocation` `resolveLine` `backlinkBonus` `scoreEntry` `buildIndex`
-`clampDebounce` `mergeSettings` `findOpenLeaf`)는 `exports._internals`로 노출되어
+`clampDebounce` `mergeSettings` `findOpenLeaf` `parseDirectives` `trimChain`)는
+`exports._internals`로 노출되어
 `npm test`에서 검증됩니다. Obsidian은 `exports.default`만 읽으므로 영향이 없습니다.
 
 ---
@@ -358,6 +390,7 @@ MIT
 
 | 버전 | 날짜 | 변경 사항 |
 |------|------|----------|
+| 2.8.0 | 2026-08 | 블록 지시어 `ancestors depth N` · `hide/show ancestors` · `hide/show descendants` |
 | 2.7.0 | 2026-08 | 플러그인이 붙인 클릭은 전부 새 탭으로 통일(현재 탭은 Tasks 백링크가 담당) |
 | 2.6.0 | 2026-08 | 탭 재사용을 일반 클릭에도 적용(기존에는 Ctrl·가운데 클릭에만) |
 | 2.5.0 | 2026-08 | 쿼리에 걸린 태스크의 설명도 클릭하면 원본으로 이동 |

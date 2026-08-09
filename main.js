@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.7.0';
+var VERSION = '2.8.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -188,6 +188,62 @@ function findOpenLeaf(workspace, path) {
     return recent && matches.indexOf(recent) !== -1 ? recent : matches[0];
 }
 
+// Split a code block's body into the directives this plugin owns and the
+// query that goes to Tasks untouched.
+//
+// Returns { query, depth, showDescendants, errors }
+//   depth            max ancestor levels above a match; null = unlimited
+//   showDescendants  true / false, or null to follow the setting
+//
+// Only lines we actually recognise are consumed. Anything else is Tasks' DSL
+// and must reach it verbatim - guessing here would silently drop a filter.
+function parseDirectives(source) {
+    var out = { query: '', depth: null, showDescendants: null, errors: [] };
+    var kept = [];
+    var lines = (source || '').split('\n');
+
+    for (var i = 0; i < lines.length; i++) {
+        var raw = lines[i];
+        var line = raw.trim().toLowerCase();
+
+        // Tasks' own tree option nests the <li>s, which breaks our matching -
+        // we build the tree ourselves, so it is dropped rather than forwarded.
+        if (/^(show|hide)[ ]+tree$/.test(line)) continue;
+
+        if (/^show[ ]+ancestors$/.test(line)) { out.depth = null; continue; }
+        if (/^hide[ ]+ancestors$/.test(line)) { out.depth = 0; continue; }
+        if (/^show[ ]+descendants$/.test(line)) { out.showDescendants = true; continue; }
+        if (/^hide[ ]+descendants$/.test(line)) { out.showDescendants = false; continue; }
+
+        var m = /^ancestors[ ]+depth[ ]+(.+)$/.exec(line);
+        if (m) {
+            var arg = m[1].trim();
+            if (/^[0-9]+$/.test(arg)) out.depth = Math.min(parseInt(arg, 10), MAX_DEPTH);
+            else out.errors.push('ancestors depth 뒤에는 0 이상의 정수가 와야 합니다: "' + raw.trim() + '"');
+            continue;
+        }
+
+        // Starts like ours but is not one of ours - say so instead of handing
+        // Tasks a line it will reject with a less useful message.
+        if (/^ancestors\b/.test(line)) {
+            out.errors.push('알 수 없는 지시어: "' + raw.trim() + '" (사용법: ancestors depth N)');
+            continue;
+        }
+
+        kept.push(raw);
+    }
+
+    out.query = kept.join('\n').trim();
+    return out;
+}
+
+// Cut an ancestor chain (root -> ... -> matched task) down to the matched task
+// plus `depth` levels above it. null/undefined keeps the whole chain.
+function trimChain(chain, depth) {
+    if (depth === null || depth === undefined) return chain;
+    var keep = depth + 1;
+    return chain.length > keep ? chain.slice(chain.length - keep) : chain;
+}
 // Keep the debounce usable. data.json is hand-editable and a stray value
 // (0, "", "abc") would either spin or freeze the view.
 function clampDebounce(value, fallback) {
@@ -456,6 +512,9 @@ var AncestorRenderChild = (function (_super) {
         _this._app = plugin.app;
         _this._source = source;
         _this._ctx = ctx;
+        // Replaced in onload(); the default keeps a child that bailed early
+        // (no Tasks plugin) from throwing if anything reaches for it.
+        _this._directives = { query: source, depth: null, showDescendants: null, errors: [] };
         _this._observer = null;
         _this._timeout = null;
         _this._processing = false;
@@ -467,6 +526,12 @@ var AncestorRenderChild = (function (_super) {
     // block is open, and the fallback keeps a detached child from throwing.
     AncestorRenderChild.prototype._settings = function () {
         return (this._plugin && this._plugin.settings) || DEFAULT_SETTINGS;
+    };
+
+    /** A block directive beats the global setting; null means "no opinion". */
+    AncestorRenderChild.prototype._wantsDescendants = function () {
+        var d = this._directives.showDescendants;
+        return d === null || d === undefined ? this._settings().showDescendants : d;
     };
 
     /** Settings changed - rebuild now instead of waiting for a Tasks re-render. */
@@ -510,15 +575,23 @@ var AncestorRenderChild = (function (_super) {
         }
         this._tasksPlugin = tasksPlugin;
 
-        // Strip show/hide tree/ancestors so Tasks does a clean flat render.
-        var cleanSource = this._source
-            .split('\n')
-            .filter(function (l) { return !/^\s*(show|hide)\s+(tree|ancestors)\s*$/i.test(l); })
-            .join('\n').trim();
+        // Take out our own directives; the rest is Tasks' DSL, unchanged.
+        var parsed = parseDirectives(this._source);
+        this._directives = parsed;
+
+        // A mistyped directive is silently ignored otherwise - the block just
+        // renders "wrong" with no clue why.
+        for (var e = 0; e < parsed.errors.length; e++) {
+            this.containerEl.createEl('div', {
+                text: 'Tasks Ancestor View: ' + parsed.errors[e],
+                cls: 'tasks-ancestor-error',
+            });
+        }
 
         // Let the Tasks plugin render the flat query (100% DSL).
-        log('requesting flat render');
-        tasksPlugin.queryRenderer.addQueryRenderChild(cleanSource, this.containerEl, this._ctx);
+        log('requesting flat render (depth=' + parsed.depth +
+            ', descendants=' + parsed.showDescendants + ')');
+        tasksPlugin.queryRenderer.addQueryRenderChild(parsed.query, this.containerEl, this._ctx);
 
         // Watch for render completion / re-renders.
         this._observer = new MutationObserver(function () {
@@ -759,6 +832,8 @@ var AncestorRenderChild = (function (_super) {
             // matched leaf and an ancestor referring to the same source line
             // collapse to a single node even when Tasks plugin returns
             // different JS objects for them.
+            chain = trimChain(chain, this._directives.depth);
+
             var node = root;
             for (var c = 0; c < chain.length; c++) {
                 var item = chain[c];
@@ -777,7 +852,7 @@ var AncestorRenderChild = (function (_super) {
             // (without #task) and plain `-` list items that live under this
             // task in the source. itemKey-based merging means descendants that
             // are themselves matched leaves collapse onto their existing node.
-            if (this._settings().showDescendants) {
+            if (this._wantsDescendants()) {
                 this._attachDescendants(node, task, 0, new Set());
             }
         }
@@ -1063,7 +1138,8 @@ var AncestorSettingTab = (function (_super) {
             .setName('하위 항목도 함께 표시')
             .setDesc(
                 '매칭된 태스크 아래에 달린 하위 항목(#task가 아닌 체크박스·일반 목록)까지 ' +
-                '트리에 펼칩니다. 끄면 조상 체인만 남습니다.'
+                '트리에 펼칩니다. 끄면 조상 체인만 남습니다. ' +
+                '블록 안에 hide descendants / show descendants 를 쓰면 그 블록에서는 그쪽이 우선합니다.'
             )
             .addToggle(function (t) {
                 t.setValue(s.showDescendants).onChange(async function (v) {
@@ -1136,6 +1212,8 @@ exports._internals = {
     itemKey: itemKey,
     DEFAULT_SETTINGS: DEFAULT_SETTINGS,
     clampDebounce: clampDebounce,
+    parseDirectives: parseDirectives,
+    trimChain: trimChain,
     mergeSettings: mergeSettings,
     itemLocation: itemLocation,
     resolveLine: resolveLine,

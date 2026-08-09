@@ -25,3 +25,10 @@
 .tasks-ancestor-clickable-task .tasks-list-text {
     cursor: pointer;
 }
+
+/* A mistyped block directive. Visible, but not alarming - the query still runs. */
+.tasks-ancestor-error {
+    color: var(--text-error);
+    font-size: var(--font-ui-smaller);
+    margin-bottom: var(--size-4-2);
+}
