@@ -32,3 +32,11 @@
     font-size: var(--font-ui-smaller);
     margin-bottom: var(--size-4-2);
 }
+
+/* Metadata lifted out of an ancestor's text. Tasks' own class names are kept
+   so themes and snippets style these the same as real task metadata. */
+.tasks-ancestor-meta {
+    margin-left: var(--size-4-2);
+    font-size: var(--font-ui-smaller);
+    opacity: 0.85;
+}

@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.8.0';
+var VERSION = '2.9.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -94,6 +94,67 @@ function plainify(s) {
         .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')         // [label](url)   -> label
         .replace(/[*_~`]/g, '')                            // emphasis / code markers
         .replace(/<[^>]+>/g, '');                          // inline HTML
+}
+
+// Tasks' emoji metadata fields (tasksPluginEmoji format), each with the class
+// name Tasks itself uses so a theme or CSS snippet styles ours identically.
+//
+// `show` decides what earns a place on an ancestor row. An ancestor is context:
+// dates, priority and recurrence help you place it, while the id / created /
+// dependsOn / onCompletion fields are bookkeeping that only adds noise there.
+// Written as escapes to keep this file ASCII - these are non-BMP characters and
+// tooling has mangled them before.
+var META_FIELDS = [
+    { sym: '\u{1F53A}', cls: 'task-priority', show: true },     // highest
+    { sym: '\u{23EB}', cls: 'task-priority', show: true },      // high
+    { sym: '\u{1F53C}', cls: 'task-priority', show: true },     // medium
+    { sym: '\u{1F53D}', cls: 'task-priority', show: true },     // low
+    { sym: '\u{23EC}', cls: 'task-priority', show: true },      // lowest
+    { sym: '\u{1F501}', cls: 'task-recurring', show: true },    // recurrence
+    { sym: '\u{1F6EB}', cls: 'task-start', show: true },        // start
+    { sym: '\u{23F3}', cls: 'task-scheduled', show: true },     // scheduled
+    { sym: '\u{1F4C5}', cls: 'task-due', show: true },          // due
+    { sym: '\u{2705}', cls: 'task-done', show: true },          // done
+    { sym: '\u{274C}', cls: 'task-cancelled', show: true },     // cancelled
+    { sym: '\u{2795}', cls: 'task-created', show: false },      // created
+    { sym: '\u{1F194}', cls: 'task-id', show: false },          // id
+    { sym: '\u{26D4}', cls: 'task-dependency', show: false },   // dependsOn
+    { sym: '\u{1F3C1}', cls: 'task-onCompletion', show: false } // onCompletion
+];
+
+// Split a task line into its description and its metadata fields.
+//
+// Scanned with indexOf rather than one big regex: these symbols are non-BMP and
+// a character class built from them silently matches surrogate halves instead.
+// Each field runs from its own symbol to the next one, so values containing
+// spaces ("every day") survive intact.
+function splitMetadata(text) {
+    var s = text || '';
+    var hits = [];
+    for (var i = 0; i < META_FIELDS.length; i++) {
+        var f = META_FIELDS[i];
+        var at = s.indexOf(f.sym);
+        while (at !== -1) {
+            hits.push({ at: at, field: f });
+            at = s.indexOf(f.sym, at + f.sym.length);
+        }
+    }
+    if (!hits.length) return { text: s.trim(), fields: [] };
+
+    hits.sort(function (a, b) { return a.at - b.at; });
+
+    var fields = [];
+    for (var h = 0; h < hits.length; h++) {
+        var start = hits[h].at + hits[h].field.sym.length;
+        var end = h + 1 < hits.length ? hits[h + 1].at : s.length;
+        fields.push({
+            cls: hits[h].field.cls,
+            show: hits[h].field.show,
+            symbol: hits[h].field.sym,
+            value: s.slice(start, end).trim()
+        });
+    }
+    return { text: s.slice(0, hits[0].at).trim(), fields: fields };
 }
 
 // Stable identity for a Task / ListItem so two different JS objects pointing
@@ -976,6 +1037,10 @@ var AncestorRenderChild = (function (_super) {
         var li = document.createElement('li');
         var md = (item && item.originalMarkdown) || '';
         var desc = stripCheckbox(md);
+        // Emoji metadata rendered as raw text is the single noisiest thing on
+        // an ancestor row - an auto-assigned id in the middle of a sentence
+        // reads as a typo. Pull it out and re-render it as Tasks-styled spans.
+        var meta = splitMetadata(desc);
 
         // Tasks plugin treats `- [ ]` without the global filter (e.g. #task)
         // as a plain ListItem (isTask=false). But visually the user still
@@ -1007,7 +1072,7 @@ var AncestorRenderChild = (function (_super) {
         // that colored-tags and other plugins can style.
         var sourcePath = (this._ctx && this._ctx.sourcePath) || '';
         await obsidian.MarkdownRenderer.render(
-            this._app, desc, span, sourcePath, this
+            this._app, meta.text, span, sourcePath, this
         );
         // MarkdownRenderer wraps content in <p>; unwrap for inline display.
         var rendered = span.querySelector('p');
@@ -1016,6 +1081,15 @@ var AncestorRenderChild = (function (_super) {
             rendered.remove();
         }
         li.appendChild(span);
+
+        // Metadata goes outside the label so a click on a date does not count
+        // as clicking the item's text.
+        for (var f = 0; f < meta.fields.length; f++) {
+            var field = meta.fields[f];
+            if (!field.show) continue;
+            var badge = li.createEl('span', { cls: field.cls + ' tasks-ancestor-meta' });
+            badge.textContent = field.value ? field.symbol + ' ' + field.value : field.symbol;
+        }
 
         li.classList.add('tasks-ancestor-item');
         // Marks this <li> as ours so the next pass can discard it - see
@@ -1209,6 +1283,7 @@ exports._internals = {
     stripCheckbox: stripCheckbox,
     normalizeWS: normalizeWS,
     plainify: plainify,
+    splitMetadata: splitMetadata,
     itemKey: itemKey,
     DEFAULT_SETTINGS: DEFAULT_SETTINGS,
     clampDebounce: clampDebounce,

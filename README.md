@@ -217,6 +217,7 @@ tasks-ancestor-view/
 ├── tests/navigation.test.js ← 위치 해석 순수함수 단위 테스트
 ├── tests/settings.test.js   ← 설정 병합 순수함수 단위 테스트
 ├── tests/directives.test.js ← 블록 지시어 파싱 단위 테스트
+├── tests/metadata.test.js   ← 메타데이터 분리 단위 테스트
 └── README.md                ← 이 문서
 ```
 
@@ -258,8 +259,8 @@ AncestorSettingTab (extends obsidian.PluginSettingTab)
 
 모듈 최상위의 순수함수(`stripCheckbox` `normalizeWS` `plainify` `itemKey`
 `itemLocation` `resolveLine` `backlinkBonus` `scoreEntry` `buildIndex`
-`clampDebounce` `mergeSettings` `findOpenLeaf` `parseDirectives` `trimChain`)는
-`exports._internals`로 노출되어
+`clampDebounce` `mergeSettings` `findOpenLeaf` `parseDirectives` `trimChain`
+`splitMetadata`)는 `exports._internals`로 노출되어
 `npm test`에서 검증됩니다. Obsidian은 `exports.default`만 읽으므로 영향이 없습니다.
 
 ---
@@ -272,7 +273,7 @@ AncestorSettingTab (extends obsidian.PluginSettingTab)
 | 조상 이동 대상 | 위치를 못 읽는 항목(`taskLocation` 없음)은 클릭해도 반응하지 않습니다. 커서가 바뀌지 않는 항목이 그렇습니다. |
 | 텍스트 매칭 한계 | 🆔가 있는 태스크는 결정적으로 매칭됩니다. 🆔가 없고 동일한 설명의 태스크가 여러 파일에 있으면 잘못 매칭될 수 있습니다(백링크 파일명·헤딩으로 보정하지만 100%는 아닙니다). |
 | Global Filter | Tasks 플러그인의 Global Filter가 설정되어 있으면 렌더된 텍스트와 원본 마크다운 간 차이가 발생할 수 있습니다. |
-| 조상 렌더링 | 조상 항목은 plain text로 표시됩니다. Tasks 플러그인처럼 날짜 이모지나 우선순위 표시는 제공하지 않습니다. |
+| 조상 렌더링 | 조상 항목의 날짜·우선순위·반복은 Tasks와 같은 클래스(`task-due` 등)로 표시되지만, Tasks처럼 상대 날짜("in 3 days")나 툴팁은 제공하지 않습니다. |
 
 ---
 
@@ -390,6 +391,7 @@ MIT
 
 | 버전 | 날짜 | 변경 사항 |
 |------|------|----------|
+| 2.9.0 | 2026-08 | 조상·자손 줄의 이모지 메타데이터를 Tasks와 같은 클래스로 분리 표시(🆔 등 부기 항목은 숨김) |
 | 2.8.0 | 2026-08 | 블록 지시어 `ancestors depth N` · `hide/show ancestors` · `hide/show descendants` |
 | 2.7.0 | 2026-08 | 플러그인이 붙인 클릭은 전부 새 탭으로 통일(현재 탭은 Tasks 백링크가 담당) |
 | 2.6.0 | 2026-08 | 탭 재사용을 일반 클릭에도 적용(기존에는 Ctrl·가운데 클릭에만) |
