@@ -8,7 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { itemLocation, resolveLine } = require('../main.js')._internals;
+const { itemLocation, resolveLine, findHostLeaf, findOtherGroup } = require('../main.js')._internals;
 
 // ---------------------------------------------------------------- itemLocation
 test('itemLocation reads the live taskLocation shape', () => {
@@ -210,4 +210,61 @@ test('findOpenLeaf falls back to getLeavesOfType on an older API', () => {
     const hit = leaf('a.md', ROOT);
     const ws = { rootSplit: ROOT, getLeavesOfType: () => [hit] };
     assert.equal(findOpenLeaf(ws, 'a.md'), hit);
+});
+
+// ---------------------------------------------------------------- split panes (v2.10.0)
+// "Open in the other split" needs two answers: which tab our block is in, and
+// which tab group is not that one. Both are pure walks over the leaf list.
+const GROUP_A = { id: 'tabsA', children: [] };
+const GROUP_B = { id: 'tabsB', children: [] };
+
+/** A leaf whose containerEl reports whether it contains a given element. */
+function paneLeaf(group, contents, root) {
+    const l = {
+        parent: group,
+        containerEl: { contains: (el) => contents.indexOf(el) !== -1 },
+    };
+    if (root !== undefined) l.getRoot = () => root;
+    return l;
+}
+
+test('findHostLeaf finds the leaf whose container holds the element', () => {
+    const el = { id: 'block' };
+    const other = paneLeaf(GROUP_A, []);
+    const host = paneLeaf(GROUP_B, [el]);
+    assert.equal(findHostLeaf([other, host], el), host);
+});
+
+test('findHostLeaf returns null for an unknown or missing element', () => {
+    const host = paneLeaf(GROUP_A, [{ id: 'x' }]);
+    assert.equal(findHostLeaf([host], { id: 'y' }), null);
+    assert.equal(findHostLeaf([host], null), null);
+    assert.equal(findHostLeaf([], { id: 'y' }), null);
+});
+
+test('findOtherGroup returns the first group that is not the host group', () => {
+    const host = paneLeaf(GROUP_A, [], ROOT);
+    const mate = paneLeaf(GROUP_A, [], ROOT);
+    const away = paneLeaf(GROUP_B, [], ROOT);
+    assert.equal(findOtherGroup([host, mate, away], host, ROOT), GROUP_B);
+});
+
+test('findOtherGroup returns null when the workspace is not split', () => {
+    const host = paneLeaf(GROUP_A, [], ROOT);
+    const mate = paneLeaf(GROUP_A, [], ROOT);
+    assert.equal(findOtherGroup([host, mate], host, ROOT), null);
+});
+
+test('findOtherGroup ignores sidebars and pop-out windows', () => {
+    // Throwing a click into another window is more surprising than a new tab.
+    const host = paneLeaf(GROUP_A, [], ROOT);
+    const docked = paneLeaf(GROUP_B, [], SIDEBAR);
+    assert.equal(findOtherGroup([host, docked], host, ROOT), null);
+});
+
+test('findOtherGroup gives up when the API predates leaf.parent', () => {
+    const host = leaf('a.md', ROOT);            // no .parent at all
+    const away = paneLeaf(GROUP_B, [], ROOT);
+    assert.equal(findOtherGroup([host, away], host, ROOT), null);
+    assert.equal(findOtherGroup([away], null, ROOT), null);
 });

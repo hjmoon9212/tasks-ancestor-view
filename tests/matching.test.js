@@ -17,6 +17,7 @@ const {
     backlinkBonus,
     scoreEntry,
     buildIndex,
+    matchItems,
 } = require('../main.js')._internals;
 
 // ---------------------------------------------------------------- helpers
@@ -130,14 +131,25 @@ test('scoreEntry ranks description matches above markdown fallbacks', () => {
     const inside = entry({ desc: 'report' });
 
     assert.equal(scoreEntry(exact, 'write report', ''), 100);
-    assert.equal(scoreEntry(prefix, 'write report', ''), 95);
-    assert.equal(scoreEntry(inside, 'write report', ''), 80);
+    assert.equal(scoreEntry(prefix, 'write report', ''), 89);   // 85 + 10 * 5/12
+    assert.equal(scoreEntry(inside, 'write report', ''), 70);   // 60 + 20 * 6/12
+});
+
+// Two descriptions can both be a prefix of the same rendered row - Tasks
+// appends metadata after the description, so that is the normal case. The one
+// accounting for more of the row is the one that owns it.
+test('scoreEntry prefers the description that covers more of the row', () => {
+    const full = entry({ desc: 'write quarterly report' });
+    const stub = entry({ desc: 'write' });
+    const rendered = 'write quarterly report 2026-08-13';
+
+    assert.ok(scoreEntry(full, rendered, '') > scoreEntry(stub, rendered, ''));
 });
 
 test('scoreEntry falls back to originalMarkdown when description misses', () => {
     assert.equal(scoreEntry(entry({ stripped: 'write report' }), 'write report', ''), 70);
-    assert.equal(scoreEntry(entry({ stripped: 'write report now' }), 'write report', ''), 50);
-    assert.equal(scoreEntry(entry({ stripped: 'write' }), 'write report', ''), 40);
+    assert.equal(scoreEntry(entry({ stripped: 'write report now' }), 'write report', ''), 48);
+    assert.equal(scoreEntry(entry({ stripped: 'write' }), 'write report', ''), 34);
 });
 
 test('scoreEntry returns 0 when nothing matches', () => {
@@ -153,10 +165,11 @@ test('scoreEntry adds the backlink bonus only to a real match', () => {
 
 test('scoreEntry keeps the better description over the better backlink', () => {
     const better = entry({ desc: 'write report' });                       // 100
-    const worse = entry({ desc: 'report', filename: 'Daily' });           // 80 + 25 = 105
-    // The backlink bonus is a tiebreak and CAN outrank a weaker text hit -
-    // this pins that intent so a future bonus change is a deliberate one.
-    assert.ok(scoreEntry(worse, 'write report', 'Daily') > scoreEntry(better, 'write report', 'Daily'));
+    const worse = entry({ desc: 'report', filename: 'Daily' });           // 70 + 25 = 95
+    // The backlink is a tiebreak, not evidence of its own. Before the length
+    // calibration a two-word description plus a filename hit outscored the task
+    // that matched the row exactly, and stole it.
+    assert.ok(scoreEntry(better, 'write report', 'Daily') > scoreEntry(worse, 'write report', 'Daily'));
 });
 
 // ---------------------------------------------------------------- buildIndex
@@ -178,17 +191,16 @@ test('buildIndex normalizes descriptions and indexes by id', () => {
     assert.equal(index.entries[0].filename, 'Plan');
     assert.equal(index.entries[0].heading, 'Today');
     assert.deepEqual(index.byId.get('vFS1gd'), [index.entries[0]]);
-    assert.deepEqual(index.byDesc.get('#task review spec'), [index.entries[0]]);
 });
 
-test('buildIndex groups duplicate ids and duplicate descriptions', () => {
+test('buildIndex groups duplicate ids', () => {
     const tasks = [
         { id: 'dup', description: 'monthly batch', filename: 'Jan' },
         { id: 'dup', description: 'monthly batch', filename: 'Feb' },
     ];
     const index = buildIndex(tasks);
     assert.equal(index.byId.get('dup').length, 2);
-    assert.equal(index.byDesc.get('monthly batch').length, 2);
+    assert.equal(index.entries.length, 2);
 });
 
 test('buildIndex skips tasks with no usable text', () => {
@@ -201,4 +213,116 @@ test('buildIndex leaves an id-less task out of byId', () => {
     const index = buildIndex([{ description: 'no id here' }]);
     assert.equal(index.byId.size, 0);
     assert.equal(index.entries.length, 1);
+});
+
+// ---------------------------------------------------------------- plainify (v2.10.0)
+// Both of these produced the duplicate-render signature: the source side was
+// reduced to something the DOM never says, so the task went unmatched and was
+// drawn twice - once appended at the end, once as a grey ancestor.
+test('plainify reduces a highlight to its text', () => {
+    assert.equal(plainify('review ==spec== now'), 'review spec now');
+});
+
+test('plainify drops a comment, which is never rendered at all', () => {
+    assert.equal(normalizeWS(plainify('review spec %%not sure%% now')), 'review spec now');
+});
+
+test('plainify leaves unpaired markers and intra-word underscores alone', () => {
+    // The DOM says "data_sync_job" too - stripping the underscores here would
+    // be the mismatch, not the fix.
+    assert.equal(plainify('run data_sync_job now'), 'run data_sync_job now');
+    assert.equal(plainify('a * b'), 'a * b');
+    assert.equal(plainify('2 _ 3'), '2 _ 3');
+});
+
+// ---------------------------------------------------------------- matchItems
+function task(over) {
+    return Object.assign({ id: '', description: '', originalMarkdown: '', filename: '', precedingHeader: '' }, over);
+}
+function li(name, over) {
+    return Object.assign({ li: name, text: '', backlink: '', id: '' }, over);
+}
+
+test('matchItems gives an exact match priority over an earlier weaker one', () => {
+    // The greedy pass this replaced walked in DOM order: "alpha beta" took the
+    // only candidate it had, and the row that matched it exactly was stranded.
+    const t1 = task({ description: 'alpha' });
+    const index = buildIndex([t1]);
+    const a = li('A', { text: 'alpha beta' });
+    const b = li('B', { text: 'alpha' });
+
+    const out = matchItems(index, [a, b]);
+    assert.equal(out.matches.length, 1);
+    assert.equal(out.matches[0].item.li, 'B');
+    assert.equal(out.matches[0].entry.task, t1);
+    assert.deepEqual(out.unmatched.map((u) => u.li), ['A']);
+});
+
+test('matchItems lets an id claim its task before any text match', () => {
+    const owned = task({ id: 'abc', description: 'monthly batch report' });
+    const other = task({ description: 'monthly batch' });
+    const index = buildIndex([owned, other]);
+    // Both rows render the same text, and A would take `owned` outright on an
+    // exact text hit - but the id on B is proof of ownership, so A has to
+    // settle for the weaker candidate.
+    const a = li('A', { text: 'monthly batch report' });
+    const b = li('B', { text: 'monthly batch report', id: 'abc' });
+
+    const out = matchItems(index, [a, b]);
+    assert.equal(out.matches.length, 2);
+    const byLi = new Map(out.matches.map((m) => [m.item.li, m.entry.task]));
+    assert.equal(byLi.get('B'), owned);
+    assert.equal(byLi.get('A'), other);
+});
+
+test('matchItems returns matches in the caller order, not id-first order', () => {
+    // The tree is built from this list, so its order is the rendered order -
+    // it has to stay the order the Tasks query produced.
+    const plain = task({ description: 'plain row' });
+    const owned = task({ id: 'abc', description: 'owned row' });
+    const index = buildIndex([plain, owned]);
+
+    const out = matchItems(index, [li('A', { text: 'plain row' }), li('B', { text: 'owned row', id: 'abc' })]);
+    assert.deepEqual(out.matches.map((m) => m.item.li), ['A', 'B']);
+});
+
+test('matchItems falls back to text when the id is unknown', () => {
+    const t1 = task({ description: 'write report' });
+    const out = matchItems(buildIndex([t1]), [li('A', { text: 'write report', id: 'gone' })]);
+    assert.equal(out.matches.length, 1);
+    assert.equal(out.matches[0].entry.task, t1);
+});
+
+test('matchItems refuses a task whose id contradicts the rendered one', () => {
+    const t1 = task({ id: 'yyy', description: 'write report' });
+    const out = matchItems(buildIndex([t1]), [li('A', { text: 'write report', id: 'xxx' })]);
+    assert.equal(out.matches.length, 0);
+    assert.deepEqual(out.unmatched.map((u) => u.li), ['A']);
+});
+
+test('matchItems tiebreaks a duplicated id on the backlink', () => {
+    // gcal-sync assigns ids automatically, so the same id can sit on several
+    // source lines; the backlink is the only thing left to tell them apart.
+    const jan = task({ id: 'dup', description: 'monthly batch', filename: 'Jan' });
+    const feb = task({ id: 'dup', description: 'monthly batch', filename: 'Feb' });
+    const index = buildIndex([jan, feb]);
+
+    const out = matchItems(index, [li('A', { text: 'monthly batch', id: 'dup', backlink: 'Feb > Today' })]);
+    assert.equal(out.matches[0].entry.task, feb);
+});
+
+test('matchItems never hands the same task to two rows', () => {
+    const t1 = task({ description: 'shared row' });
+    const out = matchItems(buildIndex([t1]), [li('A', { text: 'shared row' }), li('B', { text: 'shared row' })]);
+    assert.equal(out.matches.length, 1);
+    assert.equal(out.unmatched.length, 1);
+});
+
+test('matchItems is stable for identical input', () => {
+    const tasks = [task({ description: 'row one' }), task({ description: 'row one extra' })];
+    const index = buildIndex(tasks);
+    const pending = [li('A', { text: 'row one extra' }), li('B', { text: 'row one' })];
+    const first = matchItems(index, pending).matches.map((m) => m.item.li + ':' + m.entry.desc);
+    const again = matchItems(index, pending).matches.map((m) => m.item.li + ':' + m.entry.desc);
+    assert.deepEqual(first, again);
 });

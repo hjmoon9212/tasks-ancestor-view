@@ -92,7 +92,12 @@ group by filename
 | 제스처 | 동작 |
 |--------|------|
 | 클릭 · 가운데 클릭 | 이미 열려 있으면 **그 탭으로 이동**, 아니면 새 탭 |
+| Tab → Enter/Space | 클릭과 동일(2.10.0~). 클릭 가능한 항목만 포커스를 받습니다 |
 | Ctrl/Cmd + 클릭 | 위와 같음. 수식키 조합에 따라 분할·새 창으로도 열 수 있습니다 |
+
+새 탭을 열어야 할 때, 화면이 **이미 분할되어 있으면 반대쪽 분할**에 엽니다(2.10.0~).
+보고 있던 쿼리 결과를 가리지 않기 위해서입니다. 분할이 없으면 화면을 나누어 그쪽에
+열고, 이 동작이 싫으면 설정에서 끄면 지금 보고 있는 탭 그룹에 새 탭으로 열립니다.
 
 **현재 탭에서 열려면** 태스크 줄의 백링크(파일명 부분)를 쓰세요 — Tasks의 기존
 동작이 그대로 남아 있습니다. 쿼리 결과를 보다가 클릭하는 상황에서는 보고 있던
@@ -121,6 +126,7 @@ group by filename
 |------|--------|------|
 | 하위 항목도 함께 표시 | 켜짐 | 매칭된 태스크 **아래**에 달린 항목(`#task`가 아닌 체크박스·일반 목록)까지 트리에 펼칩니다. 끄면 조상 체인만 남습니다. |
 | 클릭하면 원본으로 이동 | 켜짐 | 끄면 텍스트가 클릭에 반응하지 않고 커서도 바뀌지 않습니다. Tasks 자체 백링크는 설정과 무관하게 그대로 동작합니다. |
+| 새 탭을 다른 분할에 열기 | 켜짐 | 화면이 분할되어 있으면 새 탭을 반대쪽 분할에 엽니다. 분할이 없으면 화면을 나눕니다. 끄면 현재 탭 그룹에 엽니다. 모바일에서는 항상 꺼진 것처럼 동작합니다. |
 | 재구성 대기 시간 | 400ms | Tasks가 목록을 다시 그린 뒤 트리를 재구성하기까지의 대기. 50~5000 범위로 보정됩니다. |
 | 디버그 로그 | 꺼짐 | 매칭 결과와 소요 시간을 콘솔에 출력합니다. |
 
@@ -176,8 +182,8 @@ hide descendants
                        ▼
 ┌─────────────────────────────────────────────────────────┐
 │  3. 매칭: 렌더된 <li> ↔ Task 객체                         │
-│     → getTasks() 결과를 1회 인덱싱 (id / 설명 / 파일명)      │
-│     → 1차: 🆔 완전일치(결정적) / 2차: 텍스트 + 백링크        │
+│     → getTasks() 결과를 재파싱마다 1회 인덱싱 (캐시)         │
+│     → 1차: 🆔 완전일치(결정적) / 2차: 점수 내림차순 전역 배정  │
 └──────────────────────┬──────────────────────────────────┘
                        ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -198,6 +204,8 @@ hide descendants
 | 결정 | 이유 |
 |------|------|
 | Tasks 플러그인에 렌더를 위임 | DSL 100% 호환. 자체 파서 불필요. Tasks 업데이트 시에도 자동 호환 |
+| 텍스트 매칭은 전역 배정 (2.10.0~) | DOM 순서 greedy는 앞선 줄이 뒤 줄의 태스크를 선점했다. 점수 내림차순으로 배정하면 순서와 무관하게 결과가 같다 |
+| 매칭·트리 구축은 순수함수 | 중복 렌더 회귀가 나오는 곳이라, 실기기 없이 `npm test`로 재현·고정할 수 있어야 한다 |
 | 원본 `<li>` 이동 (clone 아님) | 체크박스 토글, 백링크 클릭 등 Tasks 이벤트 핸들러가 모두 보존됨 |
 | 조상 `<li>`는 readOnly/disabled | 조상은 쿼리 매칭 결과가 아니므로 직접 조작 방지 |
 | prototype 패턴 (ES6 class 아님) | Obsidian CJS 번들 호환성 |
@@ -238,15 +246,12 @@ TasksAncestorPlugin (extends obsidian.Plugin)
     ├── onload()           → Tasks 플러그인 확인 → 플랫 렌더 요청 → Observer 시작
     ├── onunload()         → Observer 해제, 타이머 정리
     │
-    ├── _processResults()  → Observer 콜백 (debounced)
-    ├── _doProcess()       → 인덱스 1회 구축 → 전체 <ul> 순회
-    ├── _processOneUl()    → 잔재 제거 → 2-pass 매칭 → 트리 구축 → DOM 재구성
+    ├── _processResults()  → Observer 콜백 (debounced, 처리 중 변경은 _dirty로 재실행)
+    ├── _doProcess()       → 인덱스 조회(plugin.getIndex) → 전체 <ul> 순회
+    ├── _processOneUl()    → 잔재 제거 → matchItems() → buildTree() → DOM 재구성
     │
-    ├── _pickById()        → 🆔 완전일치 (결정적, 백링크로 tiebreak)
-    ├── _pickByText()      → 설명 완전일치 fast path → 전체 스캔
-    ├── _bestOf()          → 후보 풀에서 최고 점수 선택
-    ├── _buildTree()       → parent 체인 → 가상 트리 노드 구축
     ├── _renderTree()      → 가상 트리 → DOM 렌더링
+    ├── _newLeafFor()      → 새 탭을 어느 탭 그룹에 만들지 결정 (다른 분할 우선)
     ├── _wantsDescendants()→ 블록 지시어 > 설정 순으로 하위 표시 여부 결정
     ├── _wireMatchedLi()   → 매칭 태스크 <li>에 클릭 핸들러 (1회 등록)
     ├── _createAncestorLi()→ 조상 항목 <li> 생성 (+ 클릭 핸들러)
@@ -254,12 +259,18 @@ TasksAncestorPlugin (extends obsidian.Plugin)
     └── forceReprocess()   → 설정 변경 시 강제 재구성
 
 AncestorSettingTab (extends obsidian.PluginSettingTab)
-    └── display()          → 설정 4개. 입력 중 재렌더하지 않는다(포커스 유실 방지)
+    └── display()          → 설정 5개. 입력 중 재렌더하지 않는다(포커스 유실 방지)
 ```
+
+**매칭과 트리 구축은 클래스 밖 순수함수다.** `matchItems()`는 🆔 우선 배정과
+점수 내림차순 전역 배정을, `buildTree()`는 `.parent` 체인 순회와 itemKey 병합,
+하위 항목 확장을 전부 맡는다. 둘 다 `<li>`를 불투명 값으로만 다루므로 Obsidian
+없이 검증할 수 있고, 이 플러그인의 회귀는 거의 전부 이 두 함수 안에서 난다.
 
 모듈 최상위의 순수함수(`stripCheckbox` `normalizeWS` `plainify` `itemKey`
 `itemLocation` `resolveLine` `backlinkBonus` `scoreEntry` `buildIndex`
-`clampDebounce` `mergeSettings` `findOpenLeaf` `parseDirectives` `trimChain`
+`matchItems` `buildTree` `childList` `clampDebounce` `mergeSettings`
+`findOpenLeaf` `findHostLeaf` `findOtherGroup` `parseDirectives` `trimChain`
 `splitMetadata`)는 `exports._internals`로 노출되어
 `npm test`에서 검증됩니다. Obsidian은 `exports.default`만 읽으므로 영향이 없습니다.
 
@@ -272,6 +283,7 @@ AncestorSettingTab (extends obsidian.PluginSettingTab)
 | 조상 항목 인터랙션 | 조상 `<li>`의 체크박스는 읽기전용입니다. 토글하려면 텍스트를 클릭해 원본으로 이동한 뒤 수정하세요. |
 | 조상 이동 대상 | 위치를 못 읽는 항목(`taskLocation` 없음)은 클릭해도 반응하지 않습니다. 커서가 바뀌지 않는 항목이 그렇습니다. |
 | 텍스트 매칭 한계 | 🆔가 있는 태스크는 결정적으로 매칭됩니다. 🆔가 없고 동일한 설명의 태스크가 여러 파일에 있으면 잘못 매칭될 수 있습니다(백링크 파일명·헤딩으로 보정하지만 100%는 아닙니다). |
+| 매칭 실패의 증상 | 매칭에 실패한 줄은 목록 끝에 그대로 붙는 **동시에** 자식의 조상으로도 그려져 **중복 렌더**로 보입니다. 중복이 보이면 트리 로직이 아니라 매칭 실패를 의심하세요. 원인은 대개 렌더된 텍스트와 원본 마크다운이 어긋나는 문법(링크·강조·`==하이라이트==` 등)이며, `plainify()`가 처리하지 못하는 문법이 남아 있으면 재발합니다. |
 | Global Filter | Tasks 플러그인의 Global Filter가 설정되어 있으면 렌더된 텍스트와 원본 마크다운 간 차이가 발생할 수 있습니다. |
 | 조상 렌더링 | 조상 항목의 날짜·우선순위·반복은 Tasks와 같은 클래스(`task-due` 등)로 표시되지만, Tasks처럼 상대 날짜("in 3 days")나 툴팁은 제공하지 않습니다. |
 
@@ -376,6 +388,10 @@ app.plugins.plugins['obsidian-tasks-plugin'].getTasks()
 app.plugins.plugins['obsidian-tasks-plugin'].queryRenderer.addQueryRenderChild(source, el, ctx)
 ```
 
+분할 열기에는 Obsidian 공개 API `workspace.createLeafInParent(group, index)`와
+`leaf.parent`를 씁니다. `leaf.parent`는 Obsidian 1.6.6부터라, 그보다 낮은 버전에서는
+"다른 분할 없음"으로 보고 기존 동작(현재 탭 그룹에 새 탭)으로 되돌아갑니다.
+
 > **주의**: 이 API들은 Tasks 플러그인의 공식 외부 API가 아닌 내부 공개 멤버입니다.
 > Tasks 플러그인 메이저 업데이트 시 변경될 수 있으나, 현재까지 안정적으로 유지되고 있습니다.
 
@@ -391,6 +407,7 @@ MIT
 
 | 버전 | 날짜 | 변경 사항 |
 |------|------|----------|
+| 2.10.0 | 2026-08 | 새 탭을 다른 분할에 열기, 키보드(Tab/Enter) 이동, 텍스트 매칭 전역 배정 + 길이 보정, `==하이라이트==`·`snake_case` 중복 렌더 수정, 인덱스 캐시 |
 | 2.9.0 | 2026-08 | 조상·자손 줄의 이모지 메타데이터를 Tasks와 같은 클래스로 분리 표시(🆔 등 부기 항목은 숨김) |
 | 2.8.0 | 2026-08 | 블록 지시어 `ancestors depth N` · `hide/show ancestors` · `hide/show descendants` |
 | 2.7.0 | 2026-08 | 플러그인이 붙인 클릭은 전부 새 탭으로 통일(현재 탭은 Tasks 백링크가 담당) |

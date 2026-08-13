@@ -54,8 +54,11 @@ test('mergeSettings does not mutate or alias the defaults', () => {
 });
 
 test('mergeSettings keeps saved values', () => {
-    const merged = mergeSettings({ debounceMs: 800, showDescendants: false, clickToOpen: false, debug: true });
-    assert.deepEqual(merged, { debounceMs: 800, showDescendants: false, clickToOpen: false, debug: true });
+    const saved = {
+        debounceMs: 800, showDescendants: false, clickToOpen: false,
+        openInOtherSplit: false, debug: true,
+    };
+    assert.deepEqual(mergeSettings(saved), saved);
 });
 
 test('mergeSettings fills only the missing keys', () => {
@@ -65,6 +68,7 @@ test('mergeSettings fills only the missing keys', () => {
     assert.equal(merged.debounceMs, 200);
     assert.equal(merged.clickToOpen, true);
     assert.equal(merged.showDescendants, true);
+    assert.equal(merged.openInOtherSplit, true);
     assert.equal(merged.debug, false);
 });
 

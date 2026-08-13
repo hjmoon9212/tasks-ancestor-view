@@ -18,10 +18,15 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.9.0';
+var VERSION = '2.10.0';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
+
+// How many candidate tasks a single rendered <li> carries into the global
+// assignment. Anything past the best few has never won a row, and keeping the
+// list short is what stops a vault-sized index from dominating a render pass.
+var MAX_CANDIDATES = 5;
 
 var DEFAULT_SETTINGS = {
     // Tasks re-renders in bursts; we wait for the burst to settle before
@@ -32,6 +37,10 @@ var DEFAULT_SETTINGS = {
     showDescendants: true,
     // Clicking an ancestor's label opens its source line.
     clickToOpen: true,
+    // When that click has to open a NEW tab and the workspace is split, put
+    // the tab in the other split instead of on top of the query you clicked
+    // from. Off = always the current tab group, as before.
+    openInOtherSplit: true,
     // Per-pass console logging.
     debug: false,
 };
@@ -87,12 +96,27 @@ function normalizeWS(s) {
 // link or emphasis - such a task ends up unmatched, which makes it appear
 // twice (once appended at the end of the list, once as another match's
 // grey ancestor).
+//
+// Emphasis is stripped in PAIRS, never as bare characters. A blanket
+// `[*_~`]` removal only touches this side of the comparison, so a
+// description containing snake_case or a lone asterisk reduced to
+// "snakecase" while the DOM still said "snake_case" - the very mismatch
+// this function exists to prevent. Underscore pairs additionally require a
+// non-word boundary, because Obsidian (CommonMark) does not emphasise
+// intra-word underscores either.
 function plainify(s) {
     return (s || '')
         .replace(/!?\[\[([^\]|]+)\|([^\]]*)\]\]/g, '$2')   // [[note|alias]] -> alias
         .replace(/!?\[\[([^\]]+)\]\]/g, '$1')              // [[note]]       -> note
         .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')         // [label](url)   -> label
-        .replace(/[*_~`]/g, '')                            // emphasis / code markers
+        .replace(/%%[\s\S]*?%%/g, '')                      // %%comment%%    -> not rendered at all
+        .replace(/==([^=]+)==/g, '$1')                     // ==highlight==  -> highlight
+        .replace(/~~([^~]+)~~/g, '$1')                     // ~~strike~~
+        .replace(/\*\*([^*]+)\*\*/g, '$1')                 // **bold**
+        .replace(/\*([^*]+)\*/g, '$1')                     // *em*
+        .replace(/`([^`]+)`/g, '$1')                       // `code`
+        .replace(/(^|[^\w])__([^_]+)__(?![\w])/g, '$1$2')  // __bold__ (word boundaries only)
+        .replace(/(^|[^\w])_([^_]+)_(?![\w])/g, '$1$2')    // _em_     (word boundaries only)
         .replace(/<[^>]+>/g, '');                          // inline HTML
 }
 
@@ -249,6 +273,43 @@ function findOpenLeaf(workspace, path) {
     return recent && matches.indexOf(recent) !== -1 ? recent : matches[0];
 }
 
+// The leaf our own code block is rendered inside.
+//
+// Found by DOM containment rather than by asking the workspace what is active:
+// a click can arrive while focus sits somewhere else entirely, and "the tab I
+// clicked from" is the only thing that makes "the OTHER split" meaningful.
+function findHostLeaf(leaves, el) {
+    if (!el) return null;
+    for (var i = 0; i < leaves.length; i++) {
+        var container = leaves[i] && leaves[i].containerEl;
+        if (container && typeof container.contains === 'function' && container.contains(el)) {
+            return leaves[i];
+        }
+    }
+    return null;
+}
+
+// The first tab group in layout order that is NOT the one hostLeaf sits in,
+// or null when the workspace is not split.
+//
+// leaf.parent is the tab group (WorkspaceTabs on desktop) and is public API
+// only from Obsidian 1.6.6, while our minAppVersion is older - a missing
+// parent simply means "no other group", and the caller falls back.
+function findOtherGroup(leaves, hostLeaf, root) {
+    var home = hostLeaf && hostLeaf.parent;
+    if (!home) return null;
+    for (var i = 0; i < leaves.length; i++) {
+        var leaf = leaves[i];
+        var group = leaf && leaf.parent;
+        if (!group || group === home) continue;
+        // Same exclusion as findOpenLeaf: sidebars and pop-out windows are not
+        // "the other half of the screen".
+        if (root && typeof leaf.getRoot === 'function' && leaf.getRoot() !== root) continue;
+        return group;
+    }
+    return null;
+}
+
 // Split a code block's body into the directives this plugin owns and the
 // query that goes to Tasks untouched.
 //
@@ -320,6 +381,7 @@ function mergeSettings(saved) {
     s.debounceMs = clampDebounce(s.debounceMs, DEFAULT_SETTINGS.debounceMs);
     s.showDescendants = s.showDescendants !== false;
     s.clickToOpen = s.clickToOpen !== false;
+    s.openInOtherSplit = s.openInOtherSplit !== false;
     s.debug = !!s.debug;
     return s;
 }
@@ -365,7 +427,29 @@ function backlinkBonus(entry, backlinkText) {
     return bonus;
 }
 
+// How much of `whole` the substring `part` accounts for, 0..1. Used to tell a
+// strong match from a coincidental one: a two-word description "hits" almost
+// any rendered line, and without this weighting it scored exactly as high as
+// the task that actually owned the row.
+function coverage(part, whole) {
+    if (!part || !whole) return 0;
+    var r = part.length / whole.length;
+    return r > 1 ? 1 : r;
+}
+
 // Score one index entry against a rendered <li>. Returns 0 for "no match".
+//
+// Bands, strongest first:
+//   100      description equals the rendered text
+//   85 - 95  rendered text starts with the description - the normal case,
+//            since Tasks appends metadata spans after it
+//   70       originalMarkdown equals the rendered text (legacy fallback)
+//   60 - 80  description appears somewhere inside
+//   30 - 50  remaining originalMarkdown fallbacks
+//
+// Within a band, longer coverage wins. That is what keeps a short description
+// from stealing a longer task's row: both may be a prefix of the same rendered
+// text, but only one of them accounts for most of it.
 function scoreEntry(entry, renderedText, backlinkText) {
     var score = 0;
 
@@ -376,9 +460,9 @@ function scoreEntry(entry, renderedText, backlinkText) {
         if (renderedText === entry.desc) {
             score = 100;
         } else if (renderedText.indexOf(entry.desc) === 0) {
-            score = 95;
+            score = 85 + Math.round(10 * coverage(entry.desc, renderedText));
         } else if (renderedText.indexOf(entry.desc) !== -1) {
-            score = 80;
+            score = 60 + Math.round(20 * coverage(entry.desc, renderedText));
         }
     }
 
@@ -387,9 +471,9 @@ function scoreEntry(entry, renderedText, backlinkText) {
         if (entry.stripped === renderedText) {
             score = 70;
         } else if (entry.stripped.indexOf(renderedText) !== -1) {
-            score = 50;
+            score = 40 + Math.round(10 * coverage(renderedText, entry.stripped));
         } else if (renderedText.indexOf(entry.stripped) !== -1) {
-            score = 40;
+            score = 30 + Math.round(10 * coverage(entry.stripped, renderedText));
         }
     }
 
@@ -397,13 +481,12 @@ function scoreEntry(entry, renderedText, backlinkText) {
     return score + backlinkBonus(entry, backlinkText);
 }
 
-// Precompute every string comparison input once per render pass. Without
-// this, matching is O(rendered <li> x all vault tasks) with two regex
-// passes per comparison - and the cost multiplies by the number of group
-// <ul>s a query produces.
+// Precompute every string comparison input once per Tasks re-parse (see
+// TasksAncestorPlugin.getIndex). Without this, matching is O(rendered <li> x
+// all vault tasks) with several regex passes per comparison - and the cost
+// multiplies by the number of group <ul>s a query produces.
 function buildIndex(allTasks) {
     var byId = new Map();
-    var byDesc = new Map();
     var entries = [];
 
     for (var i = 0; i < allTasks.length; i++) {
@@ -424,13 +507,198 @@ function buildIndex(allTasks) {
             if (!byId.has(entry.id)) byId.set(entry.id, []);
             byId.get(entry.id).push(entry);
         }
-        if (entry.desc) {
-            if (!byDesc.has(entry.desc)) byDesc.set(entry.desc, []);
-            byDesc.get(entry.desc).push(entry);
+    }
+
+    return { byId: byId, entries: entries };
+}
+
+// --- matching -------------------------------------------------------
+// An id exact match is definitive. Multiple source lines can carry the same
+// id (gcal-sync assigns them automatically), so tiebreak on backlink.
+function pickById(index, item, usedTasks) {
+    var candidates = index.byId.get(item.id);
+    if (!candidates) return null;
+
+    var best = null;
+    var bestBonus = -1;
+    for (var i = 0; i < candidates.length; i++) {
+        var entry = candidates[i];
+        if (usedTasks.has(entry.task)) continue;
+        var bonus = backlinkBonus(entry, item.backlink);
+        if (bonus > bestBonus) { bestBonus = bonus; best = entry; }
+    }
+    return best;
+}
+
+// Deterministic ordering for candidate pairs: best score, then the more
+// specific (longer) description, then source order. Nothing is left to sort
+// stability - the same list must produce the same tree on every pass.
+function comparePairs(a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    var la = (a.entry.desc || '').length;
+    var lb = (b.entry.desc || '').length;
+    if (lb !== la) return lb - la;
+    if (a.item !== b.item) return a.item - b.item;
+    return a.order - b.order;
+}
+
+// Assign rendered <li> items to index entries.
+//
+// `pending` items are {li, text, backlink, id}. The li is opaque here, which
+// is what lets the whole assignment run under node --test on plain objects.
+//
+// Two passes, because the two signals are not the same kind of evidence:
+//   1. An id is definitive - those items claim their task outright, before a
+//      text heuristic can spend it on somebody else.
+//   2. Everything else is assigned GLOBALLY, best score first, instead of in
+//      DOM order. The old per-item greedy walk let whichever li came first
+//      take a task that a later, better-scoring li owned outright.
+//
+// Returns {matches, unmatched}, both in the caller's original order, so the
+// rendered tree keeps the sort order Tasks produced.
+function matchItems(index, pending) {
+    var assigned = new Map();     // index into pending -> index entry
+    var usedTasks = new Set();
+    var leftovers = [];
+
+    for (var p = 0; p < pending.length; p++) {
+        if (!pending[p].id) { leftovers.push(p); continue; }
+        var picked = pickById(index, pending[p], usedTasks);
+        if (picked) {
+            assigned.set(p, picked);
+            usedTasks.add(picked.task);
+        } else {
+            leftovers.push(p);    // unknown id -> fall back to text matching
         }
     }
 
-    return { byId: byId, byDesc: byDesc, entries: entries };
+    // Collect plausible pairs, capped per item so a vault-sized index cannot
+    // turn the sort below into the expensive part of a render pass.
+    var pairs = [];
+    for (var l = 0; l < leftovers.length; l++) {
+        var idx = leftovers[l];
+        var item = pending[idx];
+        var candidates = [];
+        for (var e = 0; e < index.entries.length; e++) {
+            var entry = index.entries[e];
+            if (usedTasks.has(entry.task)) continue;
+            // Hard disambiguation: if both the rendered li and the task carry
+            // an id, a mismatch is a definitive non-match.
+            if (item.id && entry.id && item.id !== entry.id) continue;
+            var score = scoreEntry(entry, item.text, item.backlink);
+            if (score <= 0) continue;
+            candidates.push({ item: idx, entry: entry, order: e, score: score });
+        }
+        candidates.sort(comparePairs);
+        for (var k = 0; k < candidates.length && k < MAX_CANDIDATES; k++) pairs.push(candidates[k]);
+    }
+
+    pairs.sort(comparePairs);
+    for (var i = 0; i < pairs.length; i++) {
+        var pair = pairs[i];
+        if (assigned.has(pair.item) || usedTasks.has(pair.entry.task)) continue;
+        assigned.set(pair.item, pair.entry);
+        usedTasks.add(pair.entry.task);
+    }
+
+    var matches = [];
+    var unmatched = [];
+    for (var q = 0; q < pending.length; q++) {
+        var hit = assigned.get(q);
+        if (hit) matches.push({ item: pending[q], entry: hit });
+        else unmatched.push(pending[q]);
+    }
+    return { matches: matches, unmatched: unmatched };
+}
+
+// --- tree building --------------------------------------------------
+function newNode(item) {
+    return { item: item, children: [], matchedLi: null, _childMap: new Map() };
+}
+
+// Find or create the child node for an item. Keyed by source-location identity
+// so a matched leaf and an ancestor referring to the same source line collapse
+// to a single node even when Tasks hands us two different JS objects for them.
+function childFor(node, item) {
+    var key = itemKey(item);
+    if (!node._childMap.has(key)) {
+        var created = newNode(item);
+        node.children.push(created);
+        node._childMap.set(key, created);
+    }
+    return node._childMap.get(key);
+}
+
+// Tasks has shipped children as an array, a Map and a plain object across
+// versions - normalise before walking.
+function childList(ch) {
+    var kids = [];
+    if (!ch) return kids;
+    if (ch instanceof Map) { ch.forEach(function (v) { kids.push(v); }); return kids; }
+    if (Array.isArray(ch)) return ch.slice();
+    if (typeof ch.forEach === 'function') { ch.forEach(function (v) { kids.push(v); }); return kids; }
+    if (typeof ch === 'object') {
+        for (var k in ch) if (Object.prototype.hasOwnProperty.call(ch, k)) kids.push(ch[k]);
+    }
+    return kids;
+}
+
+// Attach what lives under a matched task - plain checkboxes (without the
+// global filter) and plain list items. itemKey-based merging means a
+// descendant that is itself a matched leaf collapses onto its existing node.
+function attachDescendants(parentNode, item, depth, seen) {
+    if (!item || depth >= MAX_DEPTH) return;
+    if (!item.children) return;
+
+    // Guard against a malformed parent/child cycle in the Tasks cache - one
+    // bad edge would otherwise recurse until the stack blows.
+    var selfKey = itemKey(item);
+    if (seen.has(selfKey)) return;
+    seen.add(selfKey);
+
+    var kids = childList(item.children);
+    for (var i = 0; i < kids.length; i++) {
+        attachDescendants(childFor(parentNode, kids[i]), kids[i], depth + 1, seen);
+    }
+}
+
+// Build a virtual tree from matched tasks by walking up each task's parent
+// chain. Shared ancestors are merged.
+//
+// matches are {li, task}; li is carried through untouched. Options:
+//   depth        max ancestor levels above a match; null = unlimited
+//   descendants  also expand what lives under a matched task
+//
+// Returns a virtual root node { item:null, children:[], matchedLi:null }; each
+// child is { item:ListItem|Task, children:[], matchedLi:li|null }.
+function buildTree(matches, opts) {
+    var depth = opts && opts.depth != null ? opts.depth : null;
+    var wantDescendants = !!(opts && opts.descendants);
+    var root = newNode(null);
+
+    for (var i = 0; i < matches.length; i++) {
+        var task = matches[i].task;
+
+        // Ancestor chain, root first.
+        var chain = [];
+        var cur = task;
+        var guard = 0;
+        while (cur && guard++ < MAX_DEPTH) {
+            chain.unshift(cur);
+            cur = cur.parent;
+        }
+        chain = trimChain(chain, depth);
+
+        var node = root;
+        for (var c = 0; c < chain.length; c++) node = childFor(node, chain[c]);
+
+        // The leaf node corresponds to the matching task.
+        node.matchedLi = matches[i].li;
+
+        if (wantDescendants) attachDescendants(node, task, 0, new Set());
+    }
+
+    return root;
 }
 
 // --- DOM helpers ----------------------------------------------------
@@ -450,6 +718,22 @@ function ownQuery(li, sel) {
         if (own) return found[i];
     }
     return null;
+}
+
+// Click, middle click and keyboard, all routed through the same open().
+//
+// Enter/Space are what a keyboard user expects from role="link"; without them
+// the labels are the only unreachable thing in an otherwise navigable query
+// result, and there is no other way to follow an ancestor to its source.
+function wireOpenGestures(el, open) {
+    el.addEventListener('click', function (evt) { open(evt, false); });
+    el.addEventListener('auxclick', function (evt) {
+        if (evt.button === 1) open(evt, true);
+    });
+    el.addEventListener('keydown', function (evt) {
+        if (evt.key !== 'Enter' && evt.key !== ' ') return;
+        open(evt, false);
+    });
 }
 
 // Remove any nested <ul> children from an <li> - prevents accumulating
@@ -515,6 +799,8 @@ var TasksAncestorPlugin = (function (_super) {
         // unload() throw on _children.slice(), which takes the whole plugin
         // down when it is reloaded or updated.
         this._renderChildren = new Set();
+        // { tasks, index } for the last getTasks() array we indexed.
+        this._indexCache = null;
 
         await this.loadSettings();
         log('loaded');
@@ -530,7 +816,30 @@ var TasksAncestorPlugin = (function (_super) {
         });
     };
 
+    /**
+     * The match index for a set of tasks, built at most once per Tasks re-parse.
+     *
+     * Every open block used to index the whole vault for itself on every pass -
+     * a note with a Today block and a Done block paid for it twice. getTasks()
+     * hands back the same array until Tasks re-parses, so array identity is a
+     * safe cache key; a miss just rebuilds as before.
+     */
+    TasksAncestorPlugin.prototype.getIndex = function (allTasks) {
+        var cache = this._indexCache;
+        if (cache && cache.tasks === allTasks) {
+            log('index cache hit (' + cache.index.entries.length + ' entries)');
+            return cache.index;
+        }
+        var t0 = Date.now();
+        var index = buildIndex(allTasks);
+        log('index built: ' + index.entries.length + '/' + allTasks.length +
+            ' tasks in ' + (Date.now() - t0) + 'ms');
+        this._indexCache = { tasks: allTasks, index: index };
+        return index;
+    };
+
     TasksAncestorPlugin.prototype.onunload = function () {
+        this._indexCache = null;
         log('unloaded');
     };
 
@@ -580,6 +889,9 @@ var AncestorRenderChild = (function (_super) {
         _this._timeout = null;
         _this._processing = false;
         _this._unloaded = false;
+        // A mutation that lands mid-pass has nothing to re-trigger it: the
+        // observer is disconnected while we work. Remember it and go again.
+        _this._dirty = false;
         return _this;
     }
 
@@ -675,8 +987,10 @@ var AncestorRenderChild = (function (_super) {
 
     // -- core --------------------------------------------------------
     AncestorRenderChild.prototype._processResults = function () {
-        if (this._processing || this._unloaded || !this._observer) return;
+        if (this._unloaded || !this._observer) return;
+        if (this._processing) { this._dirty = true; return; }
         this._processing = true;
+        this._dirty = false;
         this._observer.disconnect();
 
         var self = this;
@@ -692,6 +1006,9 @@ var AncestorRenderChild = (function (_super) {
                     self._observer.observe(self.containerEl, { childList: true, subtree: true, characterData: true });
                 }
                 self._processing = false;
+                // Something changed while we were rebuilding. Cheap to redo -
+                // the ulSignature check drops out early if it was our own write.
+                if (self._dirty) self._processResults();
             }, 50);
         });
     };
@@ -711,10 +1028,10 @@ var AncestorRenderChild = (function (_super) {
         }
         if (ulsToProcess.length === 0) return;
 
-        var t0 = Date.now();
-        var index = buildIndex(allTasks);
-        log('processing ' + ulsToProcess.length + ' task list(s); indexed ' +
-            index.entries.length + '/' + allTasks.length + ' tasks in ' + (Date.now() - t0) + 'ms');
+        var index = this._plugin && typeof this._plugin.getIndex === 'function'
+            ? this._plugin.getIndex(allTasks)
+            : buildIndex(allTasks);
+        log('processing ' + ulsToProcess.length + ' task list(s)');
 
         for (var i = 0; i < ulsToProcess.length; i++) {
             if (this._unloaded) return;
@@ -766,43 +1083,25 @@ var AncestorRenderChild = (function (_super) {
             });
         }
 
-        // 3) Match. Two passes so that id-bearing items claim their task
-        //    first - a single greedy pass lets an earlier text-similarity
-        //    match steal a task that a later id-bearing item owns outright.
-        var matches = [];
-        var usedTasks = new Set();
-        var leftovers = [];
+        // 3) Match. id first, then a global best-score assignment - matchItems
+        //    owns the whole heuristic and is unit-tested.
+        var result = matchItems(index, pending);
+        for (var p = 0; p < result.unmatched.length; p++) unmatched.push(result.unmatched[p].li);
 
-        for (var p = 0; p < pending.length; p++) {
-            var item = pending[p];
-            if (!item.id) { leftovers.push(item); continue; }
-
-            var picked = this._pickById(index, item, usedTasks);
-            if (picked) {
-                matches.push({ li: item.li, task: picked.task });
-                usedTasks.add(picked.task);
-            } else {
-                leftovers.push(item);   // unknown id -> fall back to text matching
-            }
-        }
-
-        for (var q = 0; q < leftovers.length; q++) {
-            var rest = leftovers[q];
-            var found = this._pickByText(index, rest, usedTasks);
-            if (found) {
-                matches.push({ li: rest.li, task: found.task });
-                usedTasks.add(found.task);
-            } else {
-                unmatched.push(rest.li);
-            }
-        }
-
-        log('matched=' + matches.length + '  unmatched=' + unmatched.length +
+        log('matched=' + result.matches.length + '  unmatched=' + unmatched.length +
             '  in ' + (Date.now() - t0) + 'ms');
-        if (matches.length === 0) return;
+        if (result.matches.length === 0) return;
 
-        // 4) Build ancestor tree.
-        var root = this._buildTree(matches);
+        // 4) Build ancestor tree. Matches stay in DOM order, so the tree keeps
+        //    the sort order the Tasks query produced.
+        var matches = [];
+        for (var q = 0; q < result.matches.length; q++) {
+            matches.push({ li: result.matches[q].item.li, task: result.matches[q].entry.task });
+        }
+        var root = buildTree(matches, {
+            depth: this._directives.depth,
+            descendants: this._wantsDescendants()
+        });
 
         // 5) Detach all children from the UL (elements stay alive).
         while (ul.firstChild) ul.removeChild(ul.firstChild);
@@ -816,146 +1115,6 @@ var AncestorRenderChild = (function (_super) {
         }
 
         ul.setAttribute('data-tav-sig', ulSignature(ul));
-    };
-
-    // -- matching ----------------------------------------------------
-    // An id exact match is definitive. Multiple source lines can carry the
-    // same id (gcal-sync assigns them automatically), so tiebreak on backlink.
-    AncestorRenderChild.prototype._pickById = function (index, item, usedTasks) {
-        var candidates = index.byId.get(item.id);
-        if (!candidates) return null;
-
-        var best = null;
-        var bestBonus = -1;
-        for (var i = 0; i < candidates.length; i++) {
-            var entry = candidates[i];
-            if (usedTasks.has(entry.task)) continue;
-            var bonus = backlinkBonus(entry, item.backlink);
-            if (bonus > bestBonus) { bestBonus = bonus; best = entry; }
-        }
-        return best;
-    };
-
-    AncestorRenderChild.prototype._pickByText = function (index, item, usedTasks) {
-        // Fast path: a task whose description equals the rendered text verbatim.
-        var exact = index.byDesc.get(item.text);
-        if (exact) {
-            var hit = this._bestOf(exact, item, usedTasks);
-            if (hit) return hit;
-        }
-        return this._bestOf(index.entries, item, usedTasks);
-    };
-
-    AncestorRenderChild.prototype._bestOf = function (pool, item, usedTasks) {
-        var best = null;
-        var bestScore = 0;
-        for (var i = 0; i < pool.length; i++) {
-            var entry = pool[i];
-            if (usedTasks.has(entry.task)) continue;
-            // Hard disambiguation: if both the rendered <li> and the task
-            // carry an id, a mismatch is a definitive non-match.
-            if (item.id && entry.id && item.id !== entry.id) continue;
-
-            var score = scoreEntry(entry, item.text, item.backlink);
-            if (score > bestScore) { bestScore = score; best = entry; }
-        }
-        return best;
-    };
-
-    // -- tree building -----------------------------------------------
-    /**
-     * Build a virtual tree from matched tasks by walking up each task's
-     * .parent chain.  Shared ancestors are merged (compared by itemKey).
-     *
-     * Returns a virtual root node:
-     *   { item:null, children:[], matchedLi:null }
-     *
-     * Each child node:
-     *   { item:ListItem|Task, children:[], matchedLi:HTMLElement|null }
-     */
-    AncestorRenderChild.prototype._buildTree = function (matches) {
-        var root = { item: null, children: [], matchedLi: null, _childMap: new Map() };
-
-        for (var i = 0; i < matches.length; i++) {
-            var task = matches[i].task;
-            var li = matches[i].li;
-
-            // Collect ancestor chain from root to task.
-            var chain = [];
-            var cur = task;
-            var guard = 0;
-            while (cur && guard++ < MAX_DEPTH) {
-                chain.unshift(cur);
-                cur = cur.parent;
-            }
-
-            // Walk / create tree nodes. Key by source-location identity so a
-            // matched leaf and an ancestor referring to the same source line
-            // collapse to a single node even when Tasks plugin returns
-            // different JS objects for them.
-            chain = trimChain(chain, this._directives.depth);
-
-            var node = root;
-            for (var c = 0; c < chain.length; c++) {
-                var item = chain[c];
-                var key = itemKey(item);
-                if (!node._childMap.has(key)) {
-                    var newNode = { item: item, children: [], matchedLi: null, _childMap: new Map() };
-                    node.children.push(newNode);
-                    node._childMap.set(key, newNode);
-                }
-                node = node._childMap.get(key);
-            }
-            // The leaf node corresponds to the matching task.
-            node.matchedLi = li;
-
-            // Attach descendants of the matched task - plain `- [ ]` checkboxes
-            // (without #task) and plain `-` list items that live under this
-            // task in the source. itemKey-based merging means descendants that
-            // are themselves matched leaves collapse onto their existing node.
-            if (this._wantsDescendants()) {
-                this._attachDescendants(node, task, 0, new Set());
-            }
-        }
-
-        return root;
-    };
-
-    // -- descendants -------------------------------------------------
-    AncestorRenderChild.prototype._attachDescendants = function (parentNode, item, depth, seen) {
-        if (!item || depth >= MAX_DEPTH) return;
-        var ch = item.children;
-        if (!ch) return;
-
-        // Guard against a malformed parent/child cycle in the Tasks cache -
-        // one bad edge would otherwise recurse until the stack blows.
-        var selfKey = itemKey(item);
-        if (seen.has(selfKey)) return;
-        seen.add(selfKey);
-
-        var kids = [];
-        if (ch instanceof Map) {
-            ch.forEach(function (v) { kids.push(v); });
-        } else if (Array.isArray(ch)) {
-            kids = ch.slice();
-        } else if (typeof ch.forEach === 'function') {
-            ch.forEach(function (v) { kids.push(v); });
-        } else if (typeof ch === 'object') {
-            for (var k in ch) if (Object.prototype.hasOwnProperty.call(ch, k)) kids.push(ch[k]);
-        }
-        for (var i = 0; i < kids.length; i++) {
-            var child = kids[i];
-            var key = itemKey(child);
-            var childNode;
-            if (parentNode._childMap.has(key)) {
-                childNode = parentNode._childMap.get(key);
-            } else {
-                childNode = { item: child, children: [], matchedLi: null, _childMap: new Map() };
-                parentNode.children.push(childNode);
-                parentNode._childMap.set(key, childNode);
-            }
-            this._attachDescendants(childNode, child, depth + 1, seen);
-        }
     };
 
     // -- rendering ---------------------------------------------------
@@ -1007,9 +1166,20 @@ var AncestorRenderChild = (function (_super) {
         var enabled = this._settings().clickToOpen && !!itemLocation(item);
         li.classList.toggle('tasks-ancestor-clickable-task', enabled);
 
-        if (li.getAttribute('data-tav-click')) return;
         var span = ownQuery(li, '.tasks-list-text');
         if (!span) return;
+        // Read every pass, unlike the listeners below: a row that cannot open
+        // must not stay a tab stop after the setting is turned off. The element
+        // belongs to Tasks, so leave nothing of ours behind when disabled.
+        if (enabled) {
+            span.setAttribute('tabindex', '0');
+            span.setAttribute('role', 'link');
+        } else {
+            span.removeAttribute('tabindex');
+            span.removeAttribute('role');
+        }
+
+        if (li.getAttribute('data-tav-click')) return;
         li.setAttribute('data-tav-click', '1');
 
         var self = this;
@@ -1023,10 +1193,7 @@ var AncestorRenderChild = (function (_super) {
                 console.error('Tasks Ancestor View v' + VERSION + ': open failed', e);
             });
         };
-        span.addEventListener('click', function (evt) { open(evt, false); });
-        span.addEventListener('auxclick', function (evt) {
-            if (evt.button === 1) open(evt, true);
-        });
+        wireOpenGestures(span, open);
     };
 
     /**
@@ -1109,6 +1276,8 @@ var AncestorRenderChild = (function (_super) {
             var self = this;
             li.classList.add('tasks-ancestor-clickable');
             span.setAttribute('aria-label', loc.path + ':' + (loc.line + 1));
+            span.setAttribute('tabindex', '0');
+            span.setAttribute('role', 'link');
             // addEventListener, not registerDomEvent: ancestor <li>s are thrown
             // away and rebuilt on every pass. Registering on the component would
             // pin every discarded element's handler for the block's lifetime.
@@ -1119,12 +1288,61 @@ var AncestorRenderChild = (function (_super) {
                     console.error('Tasks Ancestor View v' + VERSION + ': open failed', e);
                 });
             };
-            span.addEventListener('click', function (evt) { open(evt, false); });
-            span.addEventListener('auxclick', function (evt) {
-                if (evt.button === 1) open(evt, true);
-            });
+            wireOpenGestures(span, open);
         }
         return li;
+    };
+
+    /**
+     * The leaf a brand-new tab should live in.
+     *
+     * Returns { leaf, reveal }; reveal is true when the caller must surface the
+     * tab itself, which createLeafInParent does not do.
+     *
+     * Clicking here means leaving a query view you probably want to keep in
+     * sight, so when the workspace is already split we put the file in the
+     * OTHER half rather than on top of the block that was clicked.
+     */
+    AncestorRenderChild.prototype._newLeafFor = function (pane) {
+        var workspace = this._app.workspace;
+        // A modifier asked for something specific - honour it verbatim.
+        if (pane !== 'tab') return { leaf: workspace.getLeaf(pane), reveal: false };
+
+        var mobile = obsidian.Platform && obsidian.Platform.isMobile;
+        if (!this._settings().openInOtherSplit || mobile) {
+            return { leaf: workspace.getLeaf('tab'), reveal: false };
+        }
+
+        var root = workspace.rootSplit;
+        var leaves = allLeaves(workspace);
+        var host = findHostLeaf(leaves, this.containerEl) ||
+            (typeof workspace.getMostRecentLeaf === 'function' ? workspace.getMostRecentLeaf(root) : null);
+        // Without a host, or on an API that predates leaf.parent, we cannot
+        // tell a split workspace from a single one - do not guess at the
+        // layout, just behave the way this plugin always has.
+        if (!host || !host.parent) return { leaf: workspace.getLeaf('tab'), reveal: false };
+
+        var group = findOtherGroup(leaves, host, root);
+
+        if (!group) {
+            // Not split yet - make the second half rather than stacking a tab.
+            log('workspace not split; splitting');
+            return { leaf: workspace.getLeaf('split'), reveal: false };
+        }
+
+        if (typeof workspace.createLeafInParent === 'function') {
+            try {
+                var index = (group.children && group.children.length) || 0;
+                var leaf = workspace.createLeafInParent(group, index);
+                if (leaf) {
+                    log('opening in the other split (tab ' + index + ')');
+                    return { leaf: leaf, reveal: true };
+                }
+            } catch (e) {
+                console.error('Tasks Ancestor View v' + VERSION + ': createLeafInParent failed', e);
+            }
+        }
+        return { leaf: workspace.getLeaf('tab'), reveal: false };
     };
 
     /**
@@ -1157,9 +1375,10 @@ var AncestorRenderChild = (function (_super) {
             console.error('Tasks Ancestor View v' + VERSION + ': source read failed', e);
         }
 
-        // Every click opens a new tab. Clicking here means leaving a query
-        // view you probably want to keep, and Tasks' own backlink is already
-        // the "open in the current tab" gesture on the same row.
+        // Every click opens a new tab (in the other split when there is one -
+        // see _newLeafFor). Clicking here means leaving a query view you
+        // probably want to keep, and Tasks' own backlink is already the
+        // "open in the current tab" gesture on the same row.
         //
         // A modifier can still ask for something other than a tab: isModEvent()
         // answers 'tab' | 'split' | 'window' (or false for a bare click).
@@ -1171,7 +1390,13 @@ var AncestorRenderChild = (function (_super) {
 
         // Already open -> go to that tab instead of opening a second copy.
         var existing = findOpenLeaf(app.workspace, file.path);
-        var leaf = existing || app.workspace.getLeaf(pane);
+        var leaf = existing;
+        var reveal = !!existing;
+        if (!leaf) {
+            var made = this._newLeafFor(pane);
+            leaf = made.leaf;
+            reveal = made.reveal;
+        }
 
         // A reused tab may still be deferred; loading it first keeps the
         // scroll-to-line reliable.
@@ -1180,9 +1405,10 @@ var AncestorRenderChild = (function (_super) {
         }
 
         await leaf.openFile(file, { eState: { line: line } });
-        if (existing) {
+        if (reveal) {
             // openFile applies the eState but does not necessarily surface the
-            // tab it was already sitting in.
+            // tab - neither one it was already sitting in, nor a fresh tab we
+            // created in the other split.
             await app.workspace.revealLeaf(leaf);
             app.workspace.setActiveLeaf(leaf, { focus: true });
         }
@@ -1232,6 +1458,21 @@ var AncestorSettingTab = (function (_super) {
             .addToggle(function (t) {
                 t.setValue(s.clickToOpen).onChange(async function (v) {
                     s.clickToOpen = v;
+                    await plugin.saveSettings();
+                });
+            });
+
+        new obsidian.Setting(el)
+            .setName('새 탭을 다른 분할에 열기')
+            .setDesc(
+                '화면이 좌우(또는 상하)로 나누어져 있으면 새 탭을 반대쪽 분할에 엽니다. ' +
+                '분할이 없으면 화면을 나누어 그쪽에 엽니다. ' +
+                '끄면 지금 보고 있는 탭 그룹에 새 탭으로 열립니다. ' +
+                '이미 열려 있는 노트라면 어느 쪽이든 그 탭으로 이동합니다.'
+            )
+            .addToggle(function (t) {
+                t.setValue(s.openInOtherSplit).onChange(async function (v) {
+                    s.openInOtherSplit = v;
                     await plugin.saveSettings();
                 });
             });
@@ -1296,5 +1537,10 @@ exports._internals = {
     findOpenLeaf: findOpenLeaf,
     backlinkBonus: backlinkBonus,
     scoreEntry: scoreEntry,
-    buildIndex: buildIndex
+    buildIndex: buildIndex,
+    matchItems: matchItems,
+    buildTree: buildTree,
+    childList: childList,
+    findHostLeaf: findHostLeaf,
+    findOtherGroup: findOtherGroup
 };

@@ -40,3 +40,13 @@
     font-size: var(--font-ui-smaller);
     opacity: 0.85;
 }
+
+/* Keyboard reach (v2.10.0). Only the labels we made focusable can match this,
+   so the loose descendant selector is safe - without a visible ring, tabbing
+   through a query result goes dark exactly where it matters. */
+.tasks-ancestor-label:focus-visible,
+.tasks-ancestor-clickable-task .tasks-list-text:focus-visible {
+    outline: 2px solid var(--interactive-accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+}
