@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.10.0';
+var VERSION = '2.10.1';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -726,6 +726,19 @@ function ownQuery(li, sel) {
 // the labels are the only unreachable thing in an otherwise navigable query
 // result, and there is no other way to follow an ancestor to its source.
 function wireOpenGestures(el, open) {
+    // A mouse click must not scroll. The label is focusable for the keyboard's
+    // sake, and the browser scrolls a freshly focused element into view when it
+    // is only partly visible - which yanks the very list you clicked from, but
+    // only for rows near the edge, so it reads as random.
+    //
+    // Taking the focus ourselves with preventScroll leaves the browser's own
+    // focus step nothing to do. preventDefault() here would also stop the
+    // scroll, but it kills drag-selecting the text as well. Focus from the
+    // keyboard still scrolls, which is the whole point of tabbing to a row.
+    el.addEventListener('mousedown', function (evt) {
+        if (evt.target && evt.target.closest && evt.target.closest('a')) return;
+        if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    });
     el.addEventListener('click', function (evt) { open(evt, false); });
     el.addEventListener('auxclick', function (evt) {
         if (evt.button === 1) open(evt, true);
