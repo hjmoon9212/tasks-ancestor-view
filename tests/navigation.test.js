@@ -8,7 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { itemLocation, resolveLine, findHostLeaf, findOtherGroup } = require('../main.js')._internals;
+const { itemLocation, resolveLine, findHostLeaf, findOtherGroup, findScroller } = require('../main.js')._internals;
 
 // ---------------------------------------------------------------- itemLocation
 test('itemLocation reads the live taskLocation shape', () => {
@@ -267,4 +267,38 @@ test('findOtherGroup gives up when the API predates leaf.parent', () => {
     const away = paneLeaf(GROUP_B, [], ROOT);
     assert.equal(findOtherGroup([host, away], host, ROOT), null);
     assert.equal(findOtherGroup([away], null, ROOT), null);
+});
+
+// ---------------------------------------------------------------- findScroller (v2.10.2)
+// Restoring the clicked list's scroll position first needs the element that
+// actually scrolls. Fakes carry only what findScroller touches.
+function domNode(over) {
+    return Object.assign({ closest: () => null, parentElement: null, scrollHeight: 0, clientHeight: 0 }, over);
+}
+
+test('findScroller prefers the known scroll containers', () => {
+    const view = domNode({});
+    const el = domNode({ closest: (sel) => (sel.includes('markdown-preview-view') ? view : null) });
+    assert.equal(findScroller(el), view);
+});
+
+test('findScroller walks up to the nearest scrollable ancestor', () => {
+    // The fallback matters because a renamed Obsidian class would otherwise
+    // silently turn scroll restoration off.
+    const scroller = domNode({ scrollHeight: 4000, clientHeight: 900 });
+    const section = domNode({ parentElement: scroller });
+    const el = domNode({ parentElement: section });
+    assert.equal(findScroller(el), scroller);
+});
+
+test('findScroller ignores ancestors that do not actually scroll', () => {
+    const top = domNode({ scrollHeight: 900, clientHeight: 900 });
+    const el = domNode({ parentElement: top });
+    assert.equal(findScroller(el), null);
+});
+
+test('findScroller tolerates a missing element or closest()', () => {
+    assert.equal(findScroller(null), null);
+    const scroller = domNode({ scrollHeight: 4000, clientHeight: 900 });
+    assert.equal(findScroller({ parentElement: scroller }), scroller);
 });

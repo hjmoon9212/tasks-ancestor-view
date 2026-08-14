@@ -18,7 +18,7 @@
  * workflow fails the build when the git tag and manifest disagree.
  */
 
-var VERSION = '2.10.1';
+var VERSION = '2.10.2';
 
 // Deepest ancestor chain / descendant recursion we will follow.
 var MAX_DEPTH = 20;
@@ -720,12 +720,35 @@ function ownQuery(li, sel) {
     return null;
 }
 
+// The element that actually scrolls around a rendered block: the reading view
+// scrolls .markdown-preview-view, the editor scrolls .cm-scroller. The walk-up
+// fallback keeps this working if Obsidian renames either one - a wrong-but-
+// scrollable ancestor still beats giving up.
+function findScroller(el) {
+    if (!el) return null;
+    if (typeof el.closest === 'function') {
+        var known = el.closest('.markdown-preview-view, .cm-scroller');
+        if (known) return known;
+    }
+    var node = el.parentElement;
+    while (node) {
+        if (node.scrollHeight - node.clientHeight > 1) return node;
+        node = node.parentElement;
+    }
+    return null;
+}
+
 // Click, middle click and keyboard, all routed through the same open().
 //
 // Enter/Space are what a keyboard user expects from role="link"; without them
 // the labels are the only unreachable thing in an otherwise navigable query
 // result, and there is no other way to follow an ancestor to its source.
-function wireOpenGestures(el, open) {
+//
+// onMouseDown fires only for the mouse, and before anything can move: it is
+// where the caller records where the list was, for _restoreScroll. Keyboard
+// opens deliberately do not record - tabbing to an off-screen row is supposed
+// to scroll it into view.
+function wireOpenGestures(el, open, onMouseDown) {
     // A mouse click must not scroll. The label is focusable for the keyboard's
     // sake, and the browser scrolls a freshly focused element into view when it
     // is only partly visible - which yanks the very list you clicked from, but
@@ -738,6 +761,7 @@ function wireOpenGestures(el, open) {
     el.addEventListener('mousedown', function (evt) {
         if (evt.target && evt.target.closest && evt.target.closest('a')) return;
         if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+        if (onMouseDown) onMouseDown(el);
     });
     el.addEventListener('click', function (evt) { open(evt, false); });
     el.addEventListener('auxclick', function (evt) {
@@ -905,6 +929,8 @@ var AncestorRenderChild = (function (_super) {
         // A mutation that lands mid-pass has nothing to re-trigger it: the
         // observer is disconnected while we work. Remember it and go again.
         _this._dirty = false;
+        // Where the clicked list was sitting when the mouse went down.
+        _this._scrollAnchor = null;
         return _this;
     }
 
@@ -1206,7 +1232,7 @@ var AncestorRenderChild = (function (_super) {
                 console.error('Tasks Ancestor View v' + VERSION + ': open failed', e);
             });
         };
-        wireOpenGestures(span, open);
+        wireOpenGestures(span, open, function (target) { self._anchorScroll(target); });
     };
 
     /**
@@ -1301,9 +1327,68 @@ var AncestorRenderChild = (function (_super) {
                     console.error('Tasks Ancestor View v' + VERSION + ': open failed', e);
                 });
             };
-            wireOpenGestures(span, open);
+            wireOpenGestures(span, open, function (target) { self._anchorScroll(target); });
         }
         return li;
+    };
+
+    /** Remember where the clicked view was, before anything can move it. */
+    AncestorRenderChild.prototype._anchorScroll = function (el) {
+        var scroller = findScroller(el);
+        this._scrollAnchor = scroller ? {
+            el: scroller,
+            top: scroller.scrollTop,
+            left: scroller.scrollLeft,
+            at: Date.now(),
+        } : null;
+    };
+
+    /**
+     * Put the clicked view back where it was.
+     *
+     * Clicking a row in a pane Obsidian has not focused yet makes it activate
+     * that leaf, and something on that path moves the reading view's scroll -
+     * only on that first click, which is why it looks random. We then hand
+     * focus straight on to the tab we just opened, so the user is left staring
+     * at a list that jumped for no visible reason. Whatever moves it, the rule
+     * we want is the same: opening a file somewhere else must not disturb the
+     * list you clicked from.
+     *
+     * The scroll has already happened by the time our click handler returns, so
+     * a synchronous restore is too early - it would run before the handlers
+     * that move it. rAF catches the frame after every sync handler of that
+     * click; the timeout catches whatever Obsidian does asynchronously after.
+     */
+    AncestorRenderChild.prototype._restoreScroll = function (anchor) {
+        if (!anchor || !anchor.el || typeof requestAnimationFrame !== 'function') return;
+
+        var self = this;
+        var el = anchor.el;
+        var cancelled = false;
+        var cancel = function () { cancelled = true; };
+        // Never fight a user who started scrolling in the meantime.
+        var events = ['wheel', 'touchmove', 'keydown'];
+        for (var i = 0; i < events.length; i++) {
+            el.addEventListener(events[i], cancel, true);
+        }
+
+        var apply = function () {
+            if (cancelled || self._unloaded) return;
+            var now = el.scrollTop;
+            if (Math.abs(now - anchor.top) < 1) return;
+            el.scrollTop = anchor.top;
+            el.scrollLeft = anchor.left;
+            log('scroll restored: ' + Math.round(now) + ' -> ' + Math.round(anchor.top) +
+                ' (delta ' + Math.round(now - anchor.top) + ')');
+        };
+
+        requestAnimationFrame(apply);
+        setTimeout(function () {
+            apply();
+            for (var j = 0; j < events.length; j++) {
+                el.removeEventListener(events[j], cancel, true);
+            }
+        }, 150);
     };
 
     /**
@@ -1425,6 +1510,15 @@ var AncestorRenderChild = (function (_super) {
             await app.workspace.revealLeaf(leaf);
             app.workspace.setActiveLeaf(leaf, { focus: true });
         }
+
+        var anchor = this._scrollAnchor;
+        this._scrollAnchor = null;
+        // Opening into the very leaf our block lives in means the scroll IS the
+        // point (the source line is in this note) - leave it alone. A stale
+        // anchor from some earlier click is not ours to act on either.
+        var here = leaf && leaf.containerEl && typeof leaf.containerEl.contains === 'function' &&
+            leaf.containerEl.contains(this.containerEl);
+        if (anchor && !here && Date.now() - anchor.at < 1000) this._restoreScroll(anchor);
     };
 
     return AncestorRenderChild;
@@ -1555,5 +1649,6 @@ exports._internals = {
     buildTree: buildTree,
     childList: childList,
     findHostLeaf: findHostLeaf,
+    findScroller: findScroller,
     findOtherGroup: findOtherGroup
 };
